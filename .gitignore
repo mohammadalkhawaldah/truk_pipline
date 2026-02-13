@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Virtual environment
+pipeline_venv/
+
+# Local artifacts
+outputs/
+logs/
+data/
+test_images/
+
+# Model weights (keep local)
+weights/**/*.pt
+
+# Local debug/test images created during development
+Dump_Truck_(7097582821).jpg
+MAN_dump_truck_(2).jpg
+Peterbilt_truck_3.jpg
+
