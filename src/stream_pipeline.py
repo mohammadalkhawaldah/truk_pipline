@@ -246,6 +246,58 @@ def _calc_candidate_score_center_only(centeredness: float, conf: float) -> float
     return float(centeredness) + (float(conf) * 1e-6)
 
 
+def _draw_active_tracks_overlay(
+    display_frame,
+    tracker: IoUTracker,
+    frame_w: int,
+    frame_h: int,
+    min_bed_persist_frames: int,
+) -> None:
+    for track_id in sorted(tracker.active_tracks.keys()):
+        track = tracker.active_tracks[track_id]
+        x1, y1, x2, y2 = clamp_xyxy(*track.last_box_xyxy, frame_w, frame_h)
+        if x2 <= x1 or y2 <= y1:
+            continue
+
+        if track.smooth_truck_box_xyxy_f is not None:
+            tx1, ty1, tx2, ty2 = (
+                int(round(track.smooth_truck_box_xyxy_f[0])),
+                int(round(track.smooth_truck_box_xyxy_f[1])),
+                int(round(track.smooth_truck_box_xyxy_f[2])),
+                int(round(track.smooth_truck_box_xyxy_f[3])),
+            )
+            tx1, ty1, tx2, ty2 = clamp_xyxy(tx1, ty1, tx2, ty2, frame_w, frame_h)
+            if tx2 > tx1 and ty2 > ty1:
+                cv2.rectangle(display_frame, (tx1, ty1), (tx2, ty2), (255, 100, 0), 2)
+
+        warming = track.total_hits < min_bed_persist_frames
+        stale = track.missed_count > 0
+        if warming:
+            color = (140, 140, 140)
+        elif stale:
+            color = (0, 200, 255)
+        else:
+            color = (0, 200, 0)
+
+        cv2.rectangle(display_frame, (x1, y1), (x2, y2), color, 2)
+        if warming:
+            label = f"ID:{track_id} warming {track.total_hits}/{min_bed_persist_frames}"
+        else:
+            label = f"ID:{track_id} conf:{track.last_conf:.2f}"
+            if stale:
+                label += f" miss:{track.missed_count}"
+        cv2.putText(
+            display_frame,
+            label,
+            (x1, max(15, y1 - 6)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.50,
+            color,
+            2,
+            cv2.LINE_AA,
+        )
+
+
 def _candidate_to_overlay_image(candidate: CropCandidate, text: str, out_path: Path) -> str:
     crop = candidate.crop_bgr.copy()
     cv2.rectangle(crop, (0, 0), (crop.shape[1], 38), (0, 0, 0), -1)
@@ -423,6 +475,19 @@ def _event_material(segmentation: dict[str, Any] | None) -> str:
         return "|".join(unique) if unique else "n/a"
     dom = segmentation.get("dominant_label")
     return str(dom) if dom else "n/a"
+
+
+def _format_event_console_line(
+    ts: str,
+    event_id: int,
+    cover_status: str,
+    material: str,
+    violation: bool,
+) -> str:
+    return (
+        f"{ts} | TRUCK_ID={event_id} | COVER_STATUS={cover_status} | "
+        f"MATERIAL={material} | VIOLATION={violation}"
+    )
 
 
 def _run_heavy_phases_on_crop(candidate: CropCandidate, models: ModelBundle, seg_conf_threshold: float) -> dict[str, Any]:
@@ -675,6 +740,8 @@ def _finalize_track_event(
         irregular_type=best_run.get("irregular_type"),
         segmentation=best_run.get("segmentation"),
     )
+    raw_crop_path = events_images_dir / f"event_{track.track_id:05d}_bed_crop.jpg"
+    cv2.imwrite(str(raw_crop_path), selected_candidate.crop_bgr)
     overlay_text = f"event={track.track_id} {result_summary} violation={best_run.get('violation', False)}"
     overlay_path = events_images_dir / f"event_{track.track_id:05d}_overlay.jpg"
     _candidate_to_overlay_image(selected_candidate, overlay_text, overlay_path)
@@ -696,6 +763,7 @@ def _finalize_track_event(
         "final_reason": final_reason,
         "artifacts": {
             "best_image": track.best_image_path,
+            "bed_crop": str(raw_crop_path),
             "overlay_image": str(overlay_path),
         },
         "heavy_inference_calls": len(track.inference_runs),
@@ -710,10 +778,15 @@ def _finalize_track_event(
         irregular_type=event.get("irregular_type"),
     )
     material = _event_material(event.get("segmentation"))
-    print(
-        f"{ts} | truck_id={event['event_id']} | cover_status={cover_status} | "
-        f"material={material} | violation={event['violation']}"
+    event_line = _format_event_console_line(
+        ts=ts,
+        event_id=int(event["event_id"]),
+        cover_status=cover_status,
+        material=material,
+        violation=bool(event["violation"]),
     )
+    banner = "=" * max(100, len(event_line))
+    print(f"\n\033[1m{banner}\n{event_line}\n{banner}\033[0m")
     logger.info(
         "Finalized event %s with %s heavy call(s), violation=%s",
         event["event_id"],
@@ -735,6 +808,7 @@ def run_stream_event(
     event_infer_mode: str = config.STREAM_EVENT_INFER_MODE,
     top2: bool = config.STREAM_TOP2,
     every_n: int = config.STREAM_EVERY_N,
+    max_detect_fps: float = config.STREAM_MAX_DETECT_FPS,
     detect_conf_threshold: float | None = None,
     seg_conf_threshold: float | None = None,
     min_best_area: int = config.STREAM_MIN_BEST_AREA,
@@ -742,8 +816,13 @@ def run_stream_event(
     bed_class_ids: list[int] | None = None,
     show_preview: bool = False,
     preview_scale: float = 1.0,
+    preview_fullscreen: bool = False,
     summary_only: bool = False,
     min_event_hits: int = config.STREAM_MIN_EVENT_HITS,
+    min_bed_persist_frames: int = config.STREAM_MIN_BED_PERSIST_FRAMES,
+    track_smooth_alpha: float = config.STREAM_TRACK_SMOOTH_ALPHA,
+    track_deadband_px: float = config.STREAM_TRACK_DEADBAND_PX,
+    track_max_step_px: float = config.STREAM_TRACK_MAX_STEP_PX,
 ) -> bool:
     ensure_dirs([config.OUTPUT_DIR, config.STREAM_EVENTS_IMAGES_DIR, config.PROJECT_ROOT / "logs"])
     logger = setup_logger("stream_event", config.PROJECT_ROOT / "logs" / "stream_event.log")
@@ -761,10 +840,16 @@ def run_stream_event(
         top2 = False
         logger.warning("top2 was requested but is disabled by centered-frame policy; forcing top2=0.")
     every_n = max(1, int(every_n))
+    max_detect_fps = max(0.0, float(max_detect_fps))
     missed_M = max(1, int(missed_M))
     min_best_area = max(1, int(min_best_area))
     stable_frames = max(1, int(stable_frames))
     min_event_hits = max(1, int(min_event_hits))
+    min_bed_persist_frames = max(1, int(min_bed_persist_frames))
+    track_smooth_alpha = float(max(0.01, min(1.0, track_smooth_alpha)))
+    track_deadband_px = float(max(0.0, track_deadband_px))
+    track_max_step_px = float(max(0.0, track_max_step_px))
+    effective_min_hits = max(min_event_hits, min_bed_persist_frames)
 
     detect_conf = config.DETECT_CONF_THRESHOLD if detect_conf_threshold is None else float(detect_conf_threshold)
     seg_conf = config.PHASE5_SEG_CONF_THRESHOLD if seg_conf_threshold is None else float(seg_conf_threshold)
@@ -792,8 +877,6 @@ def run_stream_event(
         bed_class_ids=bed_class_ids if bed_class_ids is not None else config.BED_CLASS_IDS,
     )
 
-    tracker = IoUTracker(iou_threshold=iou_threshold, missed_M=missed_M, top2=top2)
-
     events_jsonl = config.STREAM_EVENTS_JSONL
     events_images_dir = config.STREAM_EVENTS_IMAGES_DIR
     ensure_dirs([events_jsonl.parent, events_images_dir])
@@ -803,14 +886,51 @@ def run_stream_event(
         logger.error("Unable to open video: %s", video)
         return False
 
+    preview_window_name = "stream_event"
+    if show_preview:
+        cv2.namedWindow(preview_window_name, cv2.WINDOW_NORMAL)
+        if preview_fullscreen:
+            cv2.setWindowProperty(
+                preview_window_name,
+                cv2.WND_PROP_FULLSCREEN,
+                cv2.WINDOW_FULLSCREEN,
+            )
+
+    video_fps = float(cap.get(cv2.CAP_PROP_FPS) or 0.0)
+    if max_detect_fps > 0.0 and video_fps > 0.0:
+        auto_every_n = max(1, int(math.ceil(video_fps / max_detect_fps)))
+        if auto_every_n > every_n:
+            logger.info(
+                "Applied max_detect_fps=%.2f with video_fps=%.2f -> every_n=%s (was %s)",
+                max_detect_fps,
+                video_fps,
+                auto_every_n,
+                every_n,
+            )
+            every_n = auto_every_n
+
+    tracker = IoUTracker(
+        iou_threshold=iou_threshold,
+        missed_M=missed_M,
+        top2=top2,
+        smooth_alpha=track_smooth_alpha,
+        smooth_deadband_px=track_deadband_px,
+        smooth_max_step_px=track_max_step_px,
+    )
+
     logger.info(
-        "Starting stream_event on %s | every_n=%s | missed_M=%s | iou_threshold=%.3f | infer_mode=%s | top2=%s",
+        "Starting stream_event on %s | every_n=%s | missed_M=%s | iou_threshold=%.3f | infer_mode=%s | top2=%s "
+        "| smooth_alpha=%.2f deadband=%.1f max_step=%.1f max_detect_fps=%.2f",
         video,
         every_n,
         missed_M,
         iou_threshold,
         event_infer_mode,
         int(top2),
+        track_smooth_alpha,
+        track_deadband_px,
+        track_max_step_px,
+        max_detect_fps,
     )
 
     frame_idx = -1
@@ -831,12 +951,20 @@ def run_stream_event(
 
             if frame_idx % every_n != 0:
                 if show_preview and display_frame is not None:
+                    frame_h, frame_w = display_frame.shape[:2]
+                    _draw_active_tracks_overlay(
+                        display_frame=display_frame,
+                        tracker=tracker,
+                        frame_w=frame_w,
+                        frame_h=frame_h,
+                        min_bed_persist_frames=min_bed_persist_frames,
+                    )
                     cv2.putText(
                         display_frame,
-                        f"frame={frame_idx} (skip detect)",
+                        f"frame={frame_idx} (skip detect) active={len(tracker.active_tracks)} events={events_finalized}",
                         (12, 28),
                         cv2.FONT_HERSHEY_SIMPLEX,
-                        0.75,
+                        0.62,
                         (0, 255, 255),
                         2,
                         cv2.LINE_AA,
@@ -849,7 +977,7 @@ def run_stream_event(
                             fy=float(preview_scale),
                             interpolation=cv2.INTER_LINEAR,
                         )
-                    cv2.imshow("stream_event", display_frame)
+                    cv2.imshow(preview_window_name, display_frame)
                     if (cv2.waitKey(1) & 0xFF) == ord("q"):
                         logger.info("Preview interrupted by user (q).")
                         break
@@ -881,6 +1009,10 @@ def run_stream_event(
                 x1, y1, x2, y2 = clamp_xyxy(x1, y1, x2, y2, frame_w, frame_h)
                 crop = frame[y1:y2, x1:x2]
                 if crop is None or crop.size == 0:
+                    continue
+
+                # Gate: do not consider bed for best-crop/event logic until it persists enough frames.
+                if track.total_hits < min_bed_persist_frames:
                     continue
 
                 area = max(0, (x2 - x1) * (y2 - y1))
@@ -931,42 +1063,10 @@ def run_stream_event(
                     cv2.imwrite(str(best_image_path), debug_frame)
                     track.best_image_path = str(best_image_path)
 
-                if show_preview and display_frame is not None:
-                    if track.smooth_truck_box_xyxy_f is not None:
-                        tx1, ty1, tx2, ty2 = (
-                            int(round(track.smooth_truck_box_xyxy_f[0])),
-                            int(round(track.smooth_truck_box_xyxy_f[1])),
-                            int(round(track.smooth_truck_box_xyxy_f[2])),
-                            int(round(track.smooth_truck_box_xyxy_f[3])),
-                        )
-                        tx1, ty1, tx2, ty2 = clamp_xyxy(tx1, ty1, tx2, ty2, frame_w, frame_h)
-                        cv2.rectangle(display_frame, (tx1, ty1), (tx2, ty2), (255, 100, 0), 2)
-                        cv2.putText(
-                            display_frame,
-                            f"TID:{track_id} TRUCK",
-                            (tx1, max(15, ty1 - 6)),
-                            cv2.FONT_HERSHEY_SIMPLEX,
-                            0.50,
-                            (255, 100, 0),
-                            2,
-                            cv2.LINE_AA,
-                        )
-                    color = (0, 200, 0) if det.source == "direct" else (0, 165, 255)
-                    cv2.rectangle(display_frame, (x1, y1), (x2, y2), color, 2)
-                    label = f"ID:{track_id} conf:{det.conf:.2f} best:{track.best_candidate.score:.1f}" if track.best_candidate else f"ID:{track_id}"
-                    cv2.putText(
-                        display_frame,
-                        label,
-                        (x1, max(15, y1 - 6)),
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        0.55,
-                        color,
-                        2,
-                        cv2.LINE_AA,
-                    )
-
             if event_infer_mode == "early":
                 for track in list(tracker.active_tracks.values()):
+                    if track.total_hits < min_bed_persist_frames:
+                        continue
                     if not _should_early_infer(track, min_best_area=min_best_area, stable_frames=stable_frames):
                         continue
                     if not top2 and len(track.inference_runs) >= 1:
@@ -997,12 +1097,12 @@ def run_stream_event(
                 track = tracker.pop_track(track_id)
                 if track is None:
                     continue
-                if track.total_hits < min_event_hits:
+                if track.total_hits < effective_min_hits:
                     logger.info(
-                        "Dropping short/noisy track %s (hits=%s < min_event_hits=%s)",
+                        "Dropping short/noisy track %s (hits=%s < effective_min_hits=%s)",
                         track.track_id,
                         track.total_hits,
-                        min_event_hits,
+                        effective_min_hits,
                     )
                     continue
                 event = _finalize_track_event(
@@ -1022,6 +1122,13 @@ def run_stream_event(
                 phase_calls_by_event.append(heavy_calls)
 
             if show_preview and display_frame is not None:
+                _draw_active_tracks_overlay(
+                    display_frame=display_frame,
+                    tracker=tracker,
+                    frame_w=frame_w,
+                    frame_h=frame_h,
+                    min_bed_persist_frames=min_bed_persist_frames,
+                )
                 status = (
                     f"frame={frame_idx} active={len(tracker.active_tracks)} "
                     f"events={events_finalized} mode={event_infer_mode} every_n={every_n}"
@@ -1045,7 +1152,7 @@ def run_stream_event(
                         fy=float(preview_scale),
                         interpolation=cv2.INTER_LINEAR,
                     )
-                cv2.imshow("stream_event", display_frame)
+                cv2.imshow(preview_window_name, display_frame)
                 if (cv2.waitKey(1) & 0xFF) == ord("q"):
                     logger.info("Preview interrupted by user (q).")
                     break
@@ -1055,12 +1162,12 @@ def run_stream_event(
                 track = tracker.pop_track(track_id)
                 if track is None:
                     continue
-                if track.total_hits < min_event_hits:
+                if track.total_hits < effective_min_hits:
                     logger.info(
-                        "Dropping short/noisy track %s at EOF (hits=%s < min_event_hits=%s)",
+                        "Dropping short/noisy track %s at EOF (hits=%s < effective_min_hits=%s)",
                         track.track_id,
                         track.total_hits,
-                        min_event_hits,
+                        effective_min_hits,
                     )
                     continue
                 event = _finalize_track_event(

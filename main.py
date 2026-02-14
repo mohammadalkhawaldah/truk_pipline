@@ -214,6 +214,30 @@ def parse_args() -> argparse.Namespace:
         help="Run detection every Nth frame in stream_event mode.",
     )
     parser.add_argument(
+        "--max-detect-fps",
+        type=float,
+        default=config.STREAM_MAX_DETECT_FPS,
+        help="Optional cap for detector run rate. 0 disables cap.",
+    )
+    parser.add_argument(
+        "--track-smooth-alpha",
+        type=float,
+        default=config.STREAM_TRACK_SMOOTH_ALPHA,
+        help="EMA alpha for track box smoothing (lower = more stable).",
+    )
+    parser.add_argument(
+        "--track-deadband-px",
+        type=float,
+        default=config.STREAM_TRACK_DEADBAND_PX,
+        help="Pixel deadband for smoothed track boxes.",
+    )
+    parser.add_argument(
+        "--track-max-step-px",
+        type=float,
+        default=config.STREAM_TRACK_MAX_STEP_PX,
+        help="Max per-update movement of a smoothed track box edge in pixels (0 disables).",
+    )
+    parser.add_argument(
         "--show",
         type=int,
         choices=[0, 1],
@@ -227,6 +251,13 @@ def parse_args() -> argparse.Namespace:
         help="Preview window resize scale for --show 1 (e.g., 0.7).",
     )
     parser.add_argument(
+        "--preview-fullscreen",
+        type=int,
+        choices=[0, 1],
+        default=0,
+        help="Show preview window in fullscreen mode during stream_event.",
+    )
+    parser.add_argument(
         "--summary-only",
         type=int,
         choices=[0, 1],
@@ -238,6 +269,12 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=config.STREAM_MIN_EVENT_HITS,
         help="Minimum matched detections required before a track is finalized into an event.",
+    )
+    parser.add_argument(
+        "--min-bed-persist-frames",
+        type=int,
+        default=config.STREAM_MIN_BED_PERSIST_FRAMES,
+        help="Bed must persist for at least this many matched frames before being considered.",
     )
     parser.add_argument(
         "--non-interactive-model-select",
@@ -278,13 +315,19 @@ def main() -> int:
             event_infer_mode=args.event_infer_mode,
             top2=bool(args.top2),
             every_n=args.every_n,
+            max_detect_fps=args.max_detect_fps,
             detect_conf_threshold=args.detect_conf,
             seg_conf_threshold=args.seg_conf,
             bed_class_ids=args.bed_class_id,
             show_preview=bool(args.show),
             preview_scale=args.preview_scale,
+            preview_fullscreen=bool(args.preview_fullscreen),
             summary_only=bool(args.summary_only),
             min_event_hits=args.min_event_hits,
+            min_bed_persist_frames=args.min_bed_persist_frames,
+            track_smooth_alpha=args.track_smooth_alpha,
+            track_deadband_px=args.track_deadband_px,
+            track_max_step_px=args.track_max_step_px,
         )
     else:
         if args.phase == "phase1":

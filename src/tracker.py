@@ -31,6 +31,7 @@ class TrackState:
     start_frame: int
     last_seen_frame: int
     last_box_xyxy: tuple[int, int, int, int]
+    raw_box_xyxy: tuple[int, int, int, int]
     last_conf: float
     missed_count: int = 0
     matched_in_update: bool = False
@@ -94,11 +95,18 @@ def _smooth_box(
     new_box: tuple[int, int, int, int],
     alpha: float,
     deadband_px: float,
+    max_step_px: float,
 ) -> tuple[float, float, float, float]:
     target = (float(new_box[0]), float(new_box[1]), float(new_box[2]), float(new_box[3]))
     smoothed = []
     for p, t in zip(prev, target):
         val = (1.0 - alpha) * p + alpha * t
+        if max_step_px > 0.0:
+            delta = val - p
+            if delta > max_step_px:
+                val = p + max_step_px
+            elif delta < -max_step_px:
+                val = p - max_step_px
         if abs(val - p) < deadband_px:
             val = p
         smoothed.append(val)
@@ -117,14 +125,20 @@ class IoUTracker:
         top2: bool = False,
         smooth_alpha: float = 0.35,
         smooth_deadband_px: float = 2.0,
-        center_dist_ratio_threshold: float = 0.55,
+        smooth_max_step_px: float = 0.0,
+        center_dist_ratio_threshold: float = 0.85,
+        reacquire_iou_threshold: float = 0.05,
+        reacquire_center_dist_ratio_threshold: float = 2.20,
     ) -> None:
         self.iou_threshold = float(iou_threshold)
         self.missed_M = int(missed_M)
         self.keep_top_k = 2 if bool(top2) else 1
         self.smooth_alpha = float(max(0.01, min(1.0, smooth_alpha)))
         self.smooth_deadband_px = float(max(0.0, smooth_deadband_px))
+        self.smooth_max_step_px = float(max(0.0, smooth_max_step_px))
         self.center_dist_ratio_threshold = float(max(0.01, center_dist_ratio_threshold))
+        self.reacquire_iou_threshold = float(max(0.0, min(1.0, reacquire_iou_threshold)))
+        self.reacquire_center_dist_ratio_threshold = float(max(0.05, reacquire_center_dist_ratio_threshold))
         self.active_tracks: dict[int, TrackState] = {}
         self.next_track_id = 1
         self.total_tracks_created = 0
@@ -140,6 +154,7 @@ class IoUTracker:
             start_frame=frame_idx,
             last_seen_frame=frame_idx,
             last_box_xyxy=det.xyxy,
+            raw_box_xyxy=det.xyxy,
             last_conf=det.conf,
             max_area_seen=area,
             last_area=area,
@@ -160,7 +175,7 @@ class IoUTracker:
         matched_results: list[tuple[int, Detection, bool]] = []
         assigned_tracks: set[int] = set()
 
-        for det in detections:
+        for det in sorted(detections, key=lambda d: d.conf, reverse=True):
             best_track_id = None
             best_iou = 0.0
             best_center_ratio = float("inf")
@@ -168,11 +183,38 @@ class IoUTracker:
             for track_id, track in self.active_tracks.items():
                 if track_id in assigned_tracks:
                     continue
-                current_iou = iou_xyxy(det.xyxy, track.last_box_xyxy)
-                center_ratio = _center_distance_ratio(det.xyxy, track.last_box_xyxy)
+                reference_box = track.raw_box_xyxy
+                current_iou = iou_xyxy(det.xyxy, reference_box)
+                center_ratio = _center_distance_ratio(det.xyxy, reference_box)
                 is_iou_match = current_iou >= self.iou_threshold
                 is_center_match = center_ratio <= self.center_dist_ratio_threshold
-                if not (is_iou_match or is_center_match):
+
+                # Reacquire fallback: if the track is still active (missed < M), allow much looser matching
+                # using truck box relation, preventing fragmentation into new IDs on brief jitter/occlusion.
+                is_reacquire_match = False
+                if (
+                    not (is_iou_match or is_center_match)
+                    and (0 < track.missed_count < self.missed_M)
+                ):
+                    if det.truck_box_xyxy is not None:
+                        if track.smooth_truck_box_xyxy_f is not None:
+                            tx1, ty1, tx2, ty2 = _round_box(track.smooth_truck_box_xyxy_f)
+                            track_truck_box = (tx1, ty1, tx2, ty2)
+                        elif track.last_box_xyxy is not None:
+                            track_truck_box = track.last_box_xyxy
+                        else:
+                            track_truck_box = None
+
+                        if track_truck_box is not None:
+                            t_iou = iou_xyxy(det.truck_box_xyxy, track_truck_box)
+                            t_center_ratio = _center_distance_ratio(det.truck_box_xyxy, track_truck_box)
+                            if (
+                                t_iou >= self.reacquire_iou_threshold
+                                or t_center_ratio <= self.reacquire_center_dist_ratio_threshold
+                            ):
+                                is_reacquire_match = True
+
+                if not (is_iou_match or is_center_match or is_reacquire_match):
                     continue
 
                 if best_track_id is None:
@@ -193,6 +235,7 @@ class IoUTracker:
             if best_track_id is not None:
                 track = self.active_tracks[best_track_id]
                 track.last_seen_frame = frame_idx
+                track.raw_box_xyxy = det.xyxy
                 if track.smooth_box_xyxy_f is None:
                     track.smooth_box_xyxy_f = (
                         float(det.xyxy[0]),
@@ -206,6 +249,7 @@ class IoUTracker:
                         new_box=det.xyxy,
                         alpha=self.smooth_alpha,
                         deadband_px=self.smooth_deadband_px,
+                        max_step_px=self.smooth_max_step_px,
                     )
                 track.last_box_xyxy = _round_box(track.smooth_box_xyxy_f)
                 if det.truck_box_xyxy is not None:
@@ -222,6 +266,7 @@ class IoUTracker:
                             new_box=det.truck_box_xyxy,
                             alpha=self.smooth_alpha,
                             deadband_px=self.smooth_deadband_px,
+                            max_step_px=self.smooth_max_step_px,
                         )
                 track.last_conf = det.conf
                 track.matched_in_update = True
