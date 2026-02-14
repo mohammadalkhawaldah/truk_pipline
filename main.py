@@ -60,6 +60,13 @@ def parse_args() -> argparse.Namespace:
         help="Explicit bed class id(s). Can be passed multiple times.",
     )
     parser.add_argument(
+        "--truck-class-id",
+        action="append",
+        type=int,
+        default=None,
+        help="Explicit truck class id(s). Can be passed multiple times.",
+    )
+    parser.add_argument(
         "--bed-class-name",
         action="append",
         type=str,
@@ -194,6 +201,37 @@ def parse_args() -> argparse.Namespace:
         help="IoU threshold for matching detections to existing tracks.",
     )
     parser.add_argument(
+        "--merge_window",
+        type=int,
+        default=config.STREAM_MERGE_WINDOW,
+        help="Merge window in frames for reusing IDs after short dropouts.",
+    )
+    parser.add_argument(
+        "--merge_iou",
+        type=float,
+        default=config.STREAM_MERGE_IOU,
+        help="Merge IoU threshold for old->new ID reuse.",
+    )
+    parser.add_argument(
+        "--merge_center_ratio",
+        type=float,
+        default=config.STREAM_MERGE_CENTER_RATIO,
+        help="Merge center distance threshold ratio (of frame diagonal).",
+    )
+    parser.add_argument(
+        "--edge_guard",
+        type=int,
+        choices=[0, 1],
+        default=1 if config.STREAM_EDGE_GUARD else 0,
+        help="Finalize only near image edge (1) or always (0).",
+    )
+    parser.add_argument(
+        "--edge_margin",
+        type=int,
+        default=config.STREAM_EDGE_MARGIN,
+        help="Edge margin in pixels for edge_guard finalization.",
+    )
+    parser.add_argument(
         "--event_infer_mode",
         type=str,
         choices=["finalize", "early"],
@@ -312,6 +350,11 @@ def main() -> int:
             seg_model_path=seg_model,
             missed_M=args.missed_M,
             iou_threshold=args.iou_threshold,
+            merge_window_frames=args.merge_window,
+            merge_iou_threshold=args.merge_iou,
+            merge_center_dist_ratio=args.merge_center_ratio,
+            edge_guard=bool(args.edge_guard),
+            edge_margin=args.edge_margin,
             event_infer_mode=args.event_infer_mode,
             top2=bool(args.top2),
             every_n=args.every_n,
@@ -319,6 +362,7 @@ def main() -> int:
             detect_conf_threshold=args.detect_conf,
             seg_conf_threshold=args.seg_conf,
             bed_class_ids=args.bed_class_id,
+            truck_class_ids=args.truck_class_id,
             show_preview=bool(args.show),
             preview_scale=args.preview_scale,
             preview_fullscreen=bool(args.preview_fullscreen),

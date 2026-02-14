@@ -13,7 +13,7 @@ import cv2
 from ultralytics import YOLO
 
 from src import config
-from src.tracker import CropCandidate, Detection, IoUTracker, TrackState, iou_xyxy
+from src.tracker import CropCandidate, Detection, IoUTracker, TrackState, expand_box_xyxy, iou_xyxy
 from src.utils import clamp_xyxy, ensure_dirs, setup_logger
 
 
@@ -87,100 +87,24 @@ def _resolve_ids_by_names(names: dict[int, str], target_names: list[str]) -> lis
     return sorted(set(resolved))
 
 
-def _resolve_bed_and_truck_ids(names: dict[int, str], bed_class_ids: list[int] | None) -> tuple[list[int], list[int]]:
+def _resolve_bed_and_truck_ids(
+    names: dict[int, str],
+    bed_class_ids: list[int] | None,
+    truck_class_ids: list[int] | None,
+) -> tuple[list[int], list[int]]:
     available_ids = set(names.keys())
     resolved_bed_ids: list[int] = []
+    resolved_truck_ids: list[int] = []
+    if truck_class_ids:
+        resolved_truck_ids = sorted([int(i) for i in truck_class_ids if int(i) in available_ids])
+    if not resolved_truck_ids:
+        resolved_truck_ids = _resolve_ids_by_names(names, config.TRUCK_FALLBACK_CLASS_NAMES)
+
     if bed_class_ids:
         resolved_bed_ids = sorted([int(i) for i in bed_class_ids if int(i) in available_ids])
     if not resolved_bed_ids:
         resolved_bed_ids = _resolve_ids_by_names(names, config.BED_CLASS_NAMES)
-    resolved_truck_ids = _resolve_ids_by_names(names, config.TRUCK_FALLBACK_CLASS_NAMES)
     return resolved_bed_ids, resolved_truck_ids
-
-
-def _heuristic_bed_from_truck_bbox(xyxy: tuple[float, float, float, float]) -> tuple[float, float, float, float]:
-    x1, y1, x2, y2 = xyxy
-    width = x2 - x1
-    height = y2 - y1
-    hx1 = x1 + config.HEURISTIC_X_START_RATIO * width
-    hx2 = x1 + config.HEURISTIC_X_END_RATIO * width
-    hy1 = y1 + config.HEURISTIC_Y_START_RATIO * height
-    hy2 = y1 + config.HEURISTIC_Y_END_RATIO * height
-    return hx1, hy1, hx2, hy2
-
-
-def _extract_bed_detections(
-    result,
-    names: dict[int, str],
-    bed_ids: list[int],
-    truck_ids: list[int],
-) -> list[Detection]:
-    orig = result.orig_img
-    h, w = orig.shape[:2]
-    boxes = result.boxes
-    detections: list[Detection] = []
-
-    if boxes is None or len(boxes) == 0:
-        return detections
-
-    for i in range(len(boxes)):
-        cls_id = int(boxes.cls[i].item())
-        if bed_ids and cls_id not in bed_ids:
-            continue
-        conf = float(boxes.conf[i].item())
-        x1, y1, x2, y2 = boxes.xyxy[i].tolist()
-        cx1, cy1, cx2, cy2 = clamp_xyxy(x1, y1, x2, y2, w, h)
-        detections.append(
-            Detection(
-                xyxy=(cx1, cy1, cx2, cy2),
-                conf=conf,
-                cls_id=cls_id,
-                cls_name=names.get(cls_id, f"class_{cls_id}"),
-                source="direct",
-            )
-        )
-
-    if detections:
-        return detections
-
-    for i in range(len(boxes)):
-        cls_id = int(boxes.cls[i].item())
-        if truck_ids and cls_id not in truck_ids:
-            continue
-        conf = float(boxes.conf[i].item())
-        x1, y1, x2, y2 = boxes.xyxy[i].tolist()
-        tx1, ty1, tx2, ty2 = clamp_xyxy(x1, y1, x2, y2, w, h)
-        hx1, hy1, hx2, hy2 = _heuristic_bed_from_truck_bbox((x1, y1, x2, y2))
-        cx1, cy1, cx2, cy2 = clamp_xyxy(hx1, hy1, hx2, hy2, w, h)
-        detections.append(
-            Detection(
-                xyxy=(cx1, cy1, cx2, cy2),
-                conf=max(0.0, conf * 0.80),
-                cls_id=cls_id,
-                cls_name=f"{names.get(cls_id, f'class_{cls_id}')}_heuristic",
-                source="heuristic",
-                truck_box_xyxy=(tx1, ty1, tx2, ty2),
-            )
-        )
-
-    return detections
-
-
-def _extract_truck_boxes(result, truck_ids: list[int]) -> list[tuple[int, int, int, int]]:
-    orig = result.orig_img
-    h, w = orig.shape[:2]
-    boxes = result.boxes
-    truck_boxes: list[tuple[int, int, int, int]] = []
-    if boxes is None or len(boxes) == 0:
-        return truck_boxes
-
-    for i in range(len(boxes)):
-        cls_id = int(boxes.cls[i].item())
-        if truck_ids and cls_id not in truck_ids:
-            continue
-        x1, y1, x2, y2 = boxes.xyxy[i].tolist()
-        truck_boxes.append(clamp_xyxy(x1, y1, x2, y2, w, h))
-    return truck_boxes
 
 
 def _bbox_center_xy(box_xyxy: tuple[int, int, int, int]) -> tuple[float, float]:
@@ -193,28 +117,7 @@ def _point_in_box(px: float, py: float, box_xyxy: tuple[int, int, int, int]) -> 
     return (px >= x1) and (px <= x2) and (py >= y1) and (py <= y2)
 
 
-def _filter_beds_inside_trucks(
-    bed_detections: list[Detection],
-    truck_boxes: list[tuple[int, int, int, int]],
-) -> list[Detection]:
-    if not truck_boxes:
-        return []
-
-    kept: list[Detection] = []
-    for det in bed_detections:
-        cx, cy = _bbox_center_xy(det.xyxy)
-        containing = [tbox for tbox in truck_boxes if _point_in_box(cx, cy, tbox)]
-        if containing:
-            best_truck = min(
-                containing,
-                key=lambda b: (cx - _bbox_center_xy(b)[0]) ** 2 + (cy - _bbox_center_xy(b)[1]) ** 2,
-            )
-            det.truck_box_xyxy = best_truck
-            kept.append(det)
-    return kept
-
-
-def _dedupe_bed_detections(detections: list[Detection], iou_threshold: float = 0.6) -> list[Detection]:
+def _dedupe_anchor_detections(detections: list[Detection], iou_threshold: float = 0.7) -> list[Detection]:
     if not detections:
         return []
     sorted_dets = sorted(detections, key=lambda d: d.conf, reverse=True)
@@ -224,6 +127,99 @@ def _dedupe_bed_detections(detections: list[Detection], iou_threshold: float = 0
             continue
         kept.append(det)
     return kept
+
+
+def _extract_anchor_detections(
+    result,
+    names: dict[int, str],
+    truck_ids: list[int],
+    bed_ids: list[int],
+) -> list[Detection]:
+    orig = result.orig_img
+    h, w = orig.shape[:2]
+    boxes = result.boxes
+    if boxes is None or len(boxes) == 0:
+        return []
+
+    truck_dets: list[Detection] = []
+    bed_dets: list[Detection] = []
+    for i in range(len(boxes)):
+        cls_id = int(boxes.cls[i].item())
+        conf = float(boxes.conf[i].item())
+        x1, y1, x2, y2 = boxes.xyxy[i].tolist()
+        box_xyxy = clamp_xyxy(x1, y1, x2, y2, w, h)
+        cls_name = names.get(cls_id, f"class_{cls_id}")
+
+        if truck_ids and cls_id in truck_ids:
+            truck_dets.append(
+                Detection(
+                    xyxy=box_xyxy,
+                    conf=conf,
+                    cls_id=cls_id,
+                    cls_name=cls_name,
+                    source="truck_direct",
+                )
+            )
+        if bed_ids and cls_id in bed_ids:
+            bed_dets.append(
+                Detection(
+                    xyxy=box_xyxy,
+                    conf=conf,
+                    cls_id=cls_id,
+                    cls_name=cls_name,
+                    source="bed_direct",
+                )
+            )
+
+    bed_dets = _dedupe_anchor_detections(bed_dets, iou_threshold=0.6)
+
+    # If no truck class exists, derive pseudo-truck anchors from bed boxes.
+    if not truck_dets and bed_dets:
+        pseudo_trucks: list[Detection] = []
+        for bed in bed_dets:
+            pseudo = expand_box_xyxy(
+                bed.xyxy,
+                x_scale=config.EXPAND_BED_TO_TRUCK_X,
+                y_scale=config.EXPAND_BED_TO_TRUCK_Y,
+                frame_w=w,
+                frame_h=h,
+            )
+            pseudo_trucks.append(
+                Detection(
+                    xyxy=pseudo,
+                    conf=max(0.0, bed.conf * 0.85),
+                    cls_id=bed.cls_id,
+                    cls_name=f"{bed.cls_name}_pseudo_truck",
+                    source="pseudo_from_bed",
+                    bed_box_xyxy=bed.xyxy,
+                    bed_conf=bed.conf,
+                )
+            )
+        return _dedupe_anchor_detections(pseudo_trucks, iou_threshold=0.7)
+
+    truck_dets = _dedupe_anchor_detections(truck_dets, iou_threshold=0.7)
+    if not truck_dets:
+        return []
+
+    # Attach best bed child to each truck anchor.
+    for truck in truck_dets:
+        best_bed = None
+        best_key = (-1.0, -1.0)
+        for bed in bed_dets:
+            iou = iou_xyxy(truck.xyxy, bed.xyxy)
+            if iou <= 0.0:
+                bx, by = _bbox_center_xy(bed.xyxy)
+                if not _point_in_box(bx, by, truck.xyxy):
+                    continue
+            key = (iou, bed.conf)
+            if key > best_key:
+                best_key = key
+                best_bed = bed
+        if best_bed is not None:
+            truck.bed_box_xyxy = best_bed.xyxy
+            truck.bed_conf = best_bed.conf
+
+    return truck_dets
 
 
 def _compute_centeredness(box_xyxy: tuple[int, int, int, int], frame_w: int, frame_h: int) -> float:
@@ -255,22 +251,20 @@ def _draw_active_tracks_overlay(
 ) -> None:
     for track_id in sorted(tracker.active_tracks.keys()):
         track = tracker.active_tracks[track_id]
-        x1, y1, x2, y2 = clamp_xyxy(*track.last_box_xyxy, frame_w, frame_h)
+        x1, y1, x2, y2 = clamp_xyxy(*track.truck_box_xyxy, frame_w, frame_h)
         if x2 <= x1 or y2 <= y1:
             continue
 
-        if track.smooth_truck_box_xyxy_f is not None:
-            tx1, ty1, tx2, ty2 = (
-                int(round(track.smooth_truck_box_xyxy_f[0])),
-                int(round(track.smooth_truck_box_xyxy_f[1])),
-                int(round(track.smooth_truck_box_xyxy_f[2])),
-                int(round(track.smooth_truck_box_xyxy_f[3])),
-            )
-            tx1, ty1, tx2, ty2 = clamp_xyxy(tx1, ty1, tx2, ty2, frame_w, frame_h)
-            if tx2 > tx1 and ty2 > ty1:
-                cv2.rectangle(display_frame, (tx1, ty1), (tx2, ty2), (255, 100, 0), 2)
+        # Truck anchor
+        cv2.rectangle(display_frame, (x1, y1), (x2, y2), (255, 100, 0), 2)
 
-        warming = track.total_hits < min_bed_persist_frames
+        # Bed child if available
+        if track.bed_box_xyxy is not None:
+            bx1, by1, bx2, by2 = clamp_xyxy(*track.bed_box_xyxy, frame_w, frame_h)
+            if bx2 > bx1 and by2 > by1:
+                cv2.rectangle(display_frame, (bx1, by1), (bx2, by2), (0, 220, 0), 2)
+
+        warming = track.bed_hits < min_bed_persist_frames
         stale = track.missed_count > 0
         if warming:
             color = (140, 140, 140)
@@ -279,11 +273,10 @@ def _draw_active_tracks_overlay(
         else:
             color = (0, 200, 0)
 
-        cv2.rectangle(display_frame, (x1, y1), (x2, y2), color, 2)
         if warming:
-            label = f"ID:{track_id} warming {track.total_hits}/{min_bed_persist_frames}"
+            label = f"ID:{track_id} warming {track.bed_hits}/{min_bed_persist_frames}"
         else:
-            label = f"ID:{track_id} conf:{track.last_conf:.2f}"
+            label = f"ID:{track_id} conf:{track.last_conf:.2f} bed_hits:{track.bed_hits}"
             if stale:
                 label += f" miss:{track.missed_count}"
         cv2.putText(
@@ -576,6 +569,7 @@ def _load_models(
     seg_model_path: Path,
     logger,
     bed_class_ids: list[int] | None,
+    truck_class_ids: list[int] | None,
 ) -> ModelBundle:
     logger.info("Loading stream models on CPU")
     detect = YOLO(str(detect_model_path))
@@ -590,7 +584,11 @@ def _load_models(
     cls3_names = _names_to_dict(cls3.names)
     seg_names = _names_to_dict(seg.names)
 
-    bed_ids, truck_ids = _resolve_bed_and_truck_ids(detect_names, bed_class_ids)
+    bed_ids, truck_ids = _resolve_bed_and_truck_ids(
+        detect_names,
+        bed_class_ids=bed_class_ids,
+        truck_class_ids=truck_class_ids,
+    )
     covered_ids = _resolve_ids_by_names(cls1_names, config.PHASE2_COVERED_CLASS_NAMES)
     uncovered_ids = _resolve_ids_by_names(cls1_names, config.PHASE2_UNCOVERED_CLASS_NAMES)
     irregular_ids = _resolve_ids_by_names(cls2_names, config.PHASE3_IRREGULAR_CLASS_NAMES)
@@ -604,7 +602,13 @@ def _load_models(
     logger.info("Phase3 model classes: %s", cls2_names)
     logger.info("Phase4 model classes: %s", cls3_names)
     logger.info("Phase5 model classes: %s", seg_names)
-    logger.info("Bed class ids: %s | Truck fallback ids: %s", bed_ids, truck_ids)
+    logger.info(
+        "Bed class ids: %s | Truck class ids: %s | explicit truck_class_ids=%s | explicit bed_class_ids=%s",
+        bed_ids,
+        truck_ids,
+        truck_class_ids,
+        bed_class_ids,
+    )
 
     return ModelBundle(
         detect=detect,
@@ -805,6 +809,11 @@ def run_stream_event(
     seg_model_path: Path | str | None = None,
     missed_M: int = config.STREAM_MISSED_M,
     iou_threshold: float = config.STREAM_IOU_THRESHOLD,
+    merge_window_frames: int = config.STREAM_MERGE_WINDOW,
+    merge_iou_threshold: float = config.STREAM_MERGE_IOU,
+    merge_center_dist_ratio: float = config.STREAM_MERGE_CENTER_RATIO,
+    edge_guard: bool = config.STREAM_EDGE_GUARD,
+    edge_margin: int = config.STREAM_EDGE_MARGIN,
     event_infer_mode: str = config.STREAM_EVENT_INFER_MODE,
     top2: bool = config.STREAM_TOP2,
     every_n: int = config.STREAM_EVERY_N,
@@ -814,6 +823,7 @@ def run_stream_event(
     min_best_area: int = config.STREAM_MIN_BEST_AREA,
     stable_frames: int = config.STREAM_STABLE_FRAMES,
     bed_class_ids: list[int] | None = None,
+    truck_class_ids: list[int] | None = None,
     show_preview: bool = False,
     preview_scale: float = 1.0,
     preview_fullscreen: bool = False,
@@ -823,6 +833,7 @@ def run_stream_event(
     track_smooth_alpha: float = config.STREAM_TRACK_SMOOTH_ALPHA,
     track_deadband_px: float = config.STREAM_TRACK_DEADBAND_PX,
     track_max_step_px: float = config.STREAM_TRACK_MAX_STEP_PX,
+    max_frames: int | None = None,
 ) -> bool:
     ensure_dirs([config.OUTPUT_DIR, config.STREAM_EVENTS_IMAGES_DIR, config.PROJECT_ROOT / "logs"])
     logger = setup_logger("stream_event", config.PROJECT_ROOT / "logs" / "stream_event.log")
@@ -842,6 +853,11 @@ def run_stream_event(
     every_n = max(1, int(every_n))
     max_detect_fps = max(0.0, float(max_detect_fps))
     missed_M = max(1, int(missed_M))
+    merge_window_frames = max(1, int(merge_window_frames))
+    merge_iou_threshold = float(max(0.0, min(1.0, merge_iou_threshold)))
+    merge_center_dist_ratio = float(max(0.0, merge_center_dist_ratio))
+    edge_margin = max(0, int(edge_margin))
+    edge_guard = bool(edge_guard)
     min_best_area = max(1, int(min_best_area))
     stable_frames = max(1, int(stable_frames))
     min_event_hits = max(1, int(min_event_hits))
@@ -849,7 +865,6 @@ def run_stream_event(
     track_smooth_alpha = float(max(0.01, min(1.0, track_smooth_alpha)))
     track_deadband_px = float(max(0.0, track_deadband_px))
     track_max_step_px = float(max(0.0, track_max_step_px))
-    effective_min_hits = max(min_event_hits, min_bed_persist_frames)
 
     detect_conf = config.DETECT_CONF_THRESHOLD if detect_conf_threshold is None else float(detect_conf_threshold)
     seg_conf = config.PHASE5_SEG_CONF_THRESHOLD if seg_conf_threshold is None else float(seg_conf_threshold)
@@ -875,6 +890,7 @@ def run_stream_event(
         seg_model_path=seg_path,
         logger=logger,
         bed_class_ids=bed_class_ids if bed_class_ids is not None else config.BED_CLASS_IDS,
+        truck_class_ids=truck_class_ids if truck_class_ids is not None else config.TRUCK_CLASS_IDS,
     )
 
     events_jsonl = config.STREAM_EVENTS_JSONL
@@ -916,15 +932,26 @@ def run_stream_event(
         smooth_alpha=track_smooth_alpha,
         smooth_deadband_px=track_deadband_px,
         smooth_max_step_px=track_max_step_px,
+        merge_window_frames=merge_window_frames,
+        merge_iou_threshold=merge_iou_threshold,
+        merge_center_dist_ratio=merge_center_dist_ratio,
+        edge_guard=edge_guard,
+        edge_margin=edge_margin,
     )
 
     logger.info(
-        "Starting stream_event on %s | every_n=%s | missed_M=%s | iou_threshold=%.3f | infer_mode=%s | top2=%s "
-        "| smooth_alpha=%.2f deadband=%.1f max_step=%.1f max_detect_fps=%.2f",
+        "Starting stream_event on %s | every_n=%s | missed_M=%s | iou_threshold=%.3f | "
+        "merge_window=%s merge_iou=%.3f merge_center_ratio=%.3f edge_guard=%s edge_margin=%s | "
+        "infer_mode=%s | top2=%s | smooth_alpha=%.2f deadband=%.1f max_step=%.1f max_detect_fps=%.2f",
         video,
         every_n,
         missed_M,
         iou_threshold,
+        merge_window_frames,
+        merge_iou_threshold,
+        merge_center_dist_ratio,
+        int(edge_guard),
+        edge_margin,
         event_infer_mode,
         int(top2),
         track_smooth_alpha,
@@ -947,6 +974,9 @@ def run_stream_event(
                 break
             frame_idx += 1
             max_frame_seen = frame_idx
+            if max_frames is not None and frame_idx >= int(max_frames):
+                logger.info("Stopping early at frame=%s due to max_frames=%s", frame_idx, max_frames)
+                break
             display_frame = frame.copy() if show_preview else None
 
             if frame_idx % every_n != 0:
@@ -985,87 +1015,83 @@ def run_stream_event(
 
             detection_frames += 1
             detect_result = models.detect.predict(source=frame, device="cpu", conf=detect_conf, verbose=False)[0]
-            truck_boxes = _extract_truck_boxes(detect_result, models.truck_ids)
-            raw_bed_detections = _extract_bed_detections(
+            frame_h, frame_w = frame.shape[:2]
+            detections = _extract_anchor_detections(
                 result=detect_result,
                 names=models.detect_names,
-                bed_ids=models.bed_ids,
                 truck_ids=models.truck_ids,
+                bed_ids=models.bed_ids,
             )
-            detections = _filter_beds_inside_trucks(raw_bed_detections, truck_boxes)
-            detections = _dedupe_bed_detections(detections, iou_threshold=0.6)
+            active_before = set(tracker.active_tracks.keys())
+            active_tracks, finalized_tracks, merge_logs = tracker.update(
+                detections=detections,
+                frame_idx=frame_idx,
+                frame_shape=(frame_h, frame_w),
+            )
+            for msg in merge_logs:
+                logger.info(msg)
 
-            matched = tracker.update(detections=detections, frame_idx=frame_idx)
+            for new_id in sorted(set(active_tracks.keys()) - active_before):
+                logger.info("Assigned TRACK_ID=%s at frame=%s", new_id, frame_idx)
 
-            frame_h, frame_w = frame.shape[:2]
-            for track_id, det, is_new in matched:
-                track = tracker.active_tracks.get(track_id)
-                if track is None:
+            for track in list(active_tracks.values()):
+                if track.last_seen_frame != frame_idx:
                     continue
-                if is_new:
-                    logger.info("Assigned TRACK_ID=%s at frame=%s", track_id, frame_idx)
+                if track.bed_box_xyxy is None:
+                    continue
 
-                x1, y1, x2, y2 = track.last_box_xyxy
-                x1, y1, x2, y2 = clamp_xyxy(x1, y1, x2, y2, frame_w, frame_h)
-                crop = frame[y1:y2, x1:x2]
+                bx1, by1, bx2, by2 = clamp_xyxy(*track.bed_box_xyxy, frame_w, frame_h)
+                if bx2 <= bx1 or by2 <= by1:
+                    continue
+                crop = frame[by1:by2, bx1:bx2]
                 if crop is None or crop.size == 0:
                     continue
 
                 # Gate: do not consider bed for best-crop/event logic until it persists enough frames.
-                if track.total_hits < min_bed_persist_frames:
+                if track.bed_hits < min_bed_persist_frames:
                     continue
 
-                area = max(0, (x2 - x1) * (y2 - y1))
-                centeredness = _compute_centeredness((x1, y1, x2, y2), frame_w, frame_h)
-                score = _calc_candidate_score_center_only(centeredness=centeredness, conf=det.conf)
+                area = max(0, (bx2 - bx1) * (by2 - by1))
+                centeredness = _compute_centeredness((bx1, by1, bx2, by2), frame_w, frame_h)
+                score = _calc_candidate_score_center_only(centeredness=centeredness, conf=track.bed_conf)
                 candidate = CropCandidate(
                     frame_idx=frame_idx,
-                    xyxy=(x1, y1, x2, y2),
+                    xyxy=(bx1, by1, bx2, by2),
                     area=area,
-                    conf=det.conf,
+                    conf=track.bed_conf,
                     centeredness=centeredness,
                     score=score,
                     crop_bgr=crop.copy(),
                 )
-                best_updated = tracker.add_candidate(track_id, candidate)
+                best_updated = tracker.add_candidate(track.track_id, candidate)
 
-                near_max = area >= int(0.95 * max(1, track.max_area_seen))
-                if area >= min_best_area and near_max:
-                    track.stable_count += 1
-                elif area >= min_best_area and track.stable_count > 0:
+                if area >= min_best_area:
                     track.stable_count += 1
                 else:
                     track.stable_count = 0
 
                 if best_updated:
                     debug_frame = frame.copy()
-                    cv2.rectangle(debug_frame, (x1, y1), (x2, y2), (0, 220, 0), 2)
-                    if track.smooth_truck_box_xyxy_f is not None:
-                        tx1, ty1, tx2, ty2 = (
-                            int(round(track.smooth_truck_box_xyxy_f[0])),
-                            int(round(track.smooth_truck_box_xyxy_f[1])),
-                            int(round(track.smooth_truck_box_xyxy_f[2])),
-                            int(round(track.smooth_truck_box_xyxy_f[3])),
-                        )
-                        tx1, ty1, tx2, ty2 = clamp_xyxy(tx1, ty1, tx2, ty2, frame_w, frame_h)
-                        cv2.rectangle(debug_frame, (tx1, ty1), (tx2, ty2), (255, 100, 0), 2)
+                    tx1, ty1, tx2, ty2 = clamp_xyxy(*track.truck_box_xyxy, frame_w, frame_h)
+                    cv2.rectangle(debug_frame, (tx1, ty1), (tx2, ty2), (255, 100, 0), 2)
+                    cv2.rectangle(debug_frame, (bx1, by1), (bx2, by2), (0, 220, 0), 2)
                     cv2.putText(
                         debug_frame,
-                        f"track={track_id} score={score:.1f}",
-                        (x1, max(15, y1 - 6)),
+                        f"track={track.track_id} score={score:.3f}",
+                        (bx1, max(15, by1 - 6)),
                         cv2.FONT_HERSHEY_SIMPLEX,
                         0.55,
                         (0, 220, 0),
                         2,
                         cv2.LINE_AA,
                     )
-                    best_image_path = events_images_dir / f"event_{track_id:05d}_best.jpg"
+                    best_image_path = events_images_dir / f"event_{track.track_id:05d}_best.jpg"
                     cv2.imwrite(str(best_image_path), debug_frame)
                     track.best_image_path = str(best_image_path)
 
             if event_infer_mode == "early":
-                for track in list(tracker.active_tracks.values()):
-                    if track.total_hits < min_bed_persist_frames:
+                for track in list(active_tracks.values()):
+                    if track.bed_hits < min_bed_persist_frames:
                         continue
                     if not _should_early_infer(track, min_best_area=min_best_area, stable_frames=stable_frames):
                         continue
@@ -1092,17 +1118,15 @@ def run_stream_event(
                         len(track.inference_runs),
                     )
 
-            ready_ids = tracker.finalize_ready_ids(frame_idx=frame_idx)
-            for track_id in ready_ids:
-                track = tracker.pop_track(track_id)
-                if track is None:
-                    continue
-                if track.total_hits < effective_min_hits:
+            for track in finalized_tracks:
+                if track.total_hits < min_event_hits or track.bed_hits < min_bed_persist_frames:
                     logger.info(
-                        "Dropping short/noisy track %s (hits=%s < effective_min_hits=%s)",
+                        "Dropping short/noisy track %s (truck_hits=%s, bed_hits=%s, min_event_hits=%s, min_bed_persist_frames=%s)",
                         track.track_id,
                         track.total_hits,
-                        effective_min_hits,
+                        track.bed_hits,
+                        min_event_hits,
+                        min_bed_persist_frames,
                     )
                     continue
                 event = _finalize_track_event(
@@ -1159,16 +1183,19 @@ def run_stream_event(
 
         if max_frame_seen >= 0:
             for track_id in sorted(list(tracker.active_tracks.keys())):
-                track = tracker.pop_track(track_id)
+                track = tracker.active_tracks.get(track_id)
                 if track is None:
                     continue
-                if track.total_hits < effective_min_hits:
+                if track.total_hits < min_event_hits or track.bed_hits < min_bed_persist_frames:
                     logger.info(
-                        "Dropping short/noisy track %s at EOF (hits=%s < effective_min_hits=%s)",
+                        "Dropping short/noisy track %s at EOF (truck_hits=%s, bed_hits=%s, min_event_hits=%s, min_bed_persist_frames=%s)",
                         track.track_id,
                         track.total_hits,
-                        effective_min_hits,
+                        track.bed_hits,
+                        min_event_hits,
+                        min_bed_persist_frames,
                     )
+                    tracker.active_tracks.pop(track_id, None)
                     continue
                 event = _finalize_track_event(
                     track=track,
@@ -1185,6 +1212,7 @@ def run_stream_event(
                 heavy_calls = int(event.get("heavy_inference_calls", 0))
                 heavy_inference_calls_total += heavy_calls
                 phase_calls_by_event.append(heavy_calls)
+                tracker.active_tracks.pop(track_id, None)
 
     finally:
         cap.release()
@@ -1193,10 +1221,11 @@ def run_stream_event(
 
     avg_heavy = (sum(phase_calls_by_event) / len(phase_calls_by_event)) if phase_calls_by_event else 0.0
     logger.info(
-        "stream_event complete | detection_frames=%s total_tracks_created=%s events_finalized=%s "
+        "stream_event complete | detection_frames=%s total_tracks_created=%s merges=%s events_finalized=%s "
         "heavy_calls_total=%s avg_heavy=%.3f",
         detection_frames,
         tracker.total_tracks_created,
+        tracker.total_merges,
         events_finalized,
         heavy_inference_calls_total,
         avg_heavy,
