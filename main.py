@@ -315,6 +315,25 @@ def parse_args() -> argparse.Namespace:
         help="Bed must persist for at least this many matched frames before being considered.",
     )
     parser.add_argument(
+        "--vote-enable",
+        type=int,
+        choices=[0, 1],
+        default=1 if config.STREAM_VOTE_ENABLE else 0,
+        help="Enable event-level majority voting using sampled bed crops across the track.",
+    )
+    parser.add_argument(
+        "--vote-every",
+        type=int,
+        default=config.STREAM_VOTE_EVERY_N_FRAMES,
+        help="Sample one bed crop every N processed frames for voting.",
+    )
+    parser.add_argument(
+        "--vote-max-samples",
+        type=int,
+        default=config.STREAM_VOTE_MAX_SAMPLES,
+        help="Maximum number of sampled crops kept per track for voting.",
+    )
+    parser.add_argument(
         "--non-interactive-model-select",
         action="store_true",
         help="Disable interactive prompt if multiple models are found; highest-scored candidate is used.",
@@ -369,6 +388,9 @@ def main() -> int:
             summary_only=bool(args.summary_only),
             min_event_hits=args.min_event_hits,
             min_bed_persist_frames=args.min_bed_persist_frames,
+            vote_enable=bool(args.vote_enable),
+            vote_every_n_frames=args.vote_every,
+            vote_max_samples=args.vote_max_samples,
             track_smooth_alpha=args.track_smooth_alpha,
             track_deadband_px=args.track_deadband_px,
             track_max_step_px=args.track_max_step_px,

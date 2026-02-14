@@ -49,6 +49,8 @@ class TrackState:
     smooth_truck_box_xyxy_f: tuple[float, float, float, float] | None = None
     best_candidate: CropCandidate | None = None
     top_candidates: list[CropCandidate] = field(default_factory=list)
+    vote_candidates: list[CropCandidate] = field(default_factory=list)
+    last_vote_sample_frame: int | None = None
     inference_runs: list[dict[str, Any]] = field(default_factory=list)
     phase_results: dict[str, Any] | None = None
     best_image_path: str | None = None
@@ -69,6 +71,8 @@ class LostTrackSnapshot:
     last_truck_box: tuple[int, int, int, int]
     last_seen_frame: int
     best_candidate: CropCandidate | None
+    vote_candidates: list[CropCandidate]
+    last_vote_sample_frame: int | None
     phase_results: dict[str, Any] | None
 
 
@@ -251,6 +255,8 @@ class IoUTracker:
                 last_truck_box=track.raw_truck_box_xyxy,
                 last_seen_frame=track.last_seen_frame,
                 best_candidate=track.best_candidate,
+                vote_candidates=list(track.vote_candidates),
+                last_vote_sample_frame=track.last_vote_sample_frame,
                 phase_results=track.phase_results,
             )
         )
@@ -384,6 +390,8 @@ class IoUTracker:
             if lost_item is not None and lost_item.track_id not in self.active_tracks:
                 track = self._create_track(det=det, frame_idx=frame_idx, track_id=lost_item.track_id)
                 track.best_candidate = lost_item.best_candidate
+                track.vote_candidates = list(lost_item.vote_candidates)
+                track.last_vote_sample_frame = lost_item.last_vote_sample_frame
                 track.phase_results = lost_item.phase_results
                 track.matched_in_update = True
                 self._remove_lost_snapshot(lost_item.track_id)
@@ -445,6 +453,29 @@ class IoUTracker:
 
         new_best_score = track.best_candidate.score if track.best_candidate is not None else float("-inf")
         return new_best_score > old_best_score
+
+    def add_vote_candidate(
+        self,
+        track_id: int,
+        candidate: CropCandidate,
+        sample_every_frames: int = 5,
+        max_samples: int = 80,
+    ) -> bool:
+        track = self.active_tracks.get(track_id)
+        if track is None:
+            return False
+
+        stride = max(1, int(sample_every_frames))
+        if track.last_vote_sample_frame is not None:
+            if (candidate.frame_idx - track.last_vote_sample_frame) < stride:
+                return False
+
+        track.vote_candidates.append(candidate)
+        track.last_vote_sample_frame = int(candidate.frame_idx)
+        keep = max(1, int(max_samples))
+        if len(track.vote_candidates) > keep:
+            track.vote_candidates = track.vote_candidates[-keep:]
+        return True
 
     def candidate_already_inferred(self, track: TrackState, frame_idx: int) -> bool:
         for run in track.inference_runs:

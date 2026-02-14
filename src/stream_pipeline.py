@@ -4,6 +4,7 @@ import json
 import logging
 import math
 import re
+from collections import Counter
 from datetime import datetime
 from dataclasses import dataclass
 from pathlib import Path
@@ -655,6 +656,41 @@ def _next_pending_candidate(track: TrackState) -> CropCandidate | None:
     return None
 
 
+def _majority_vote_run(runs: list[dict[str, Any]]) -> tuple[dict[str, Any], str, dict[str, int]]:
+    if not runs:
+        raise ValueError("runs must not be empty")
+
+    labels: list[str] = []
+    for run in runs:
+        label = _build_result_summary(
+            coverage=run.get("coverage"),
+            shape=run.get("shape"),
+            irregular_type=run.get("irregular_type"),
+            segmentation=run.get("segmentation"),
+        )
+        run["result_summary"] = label
+        labels.append(label)
+
+    counts = Counter(labels)
+    winners = sorted(counts.items(), key=lambda kv: kv[1], reverse=True)
+    top_count = winners[0][1]
+    top_labels = [lbl for lbl, c in winners if c == top_count]
+
+    # Tie-break: choose label with highest average pipeline_conf.
+    if len(top_labels) > 1:
+        avg_conf_by_label: dict[str, float] = {}
+        for lbl in top_labels:
+            vals = [float(r.get("pipeline_conf", 0.0)) for r in runs if r.get("result_summary") == lbl]
+            avg_conf_by_label[lbl] = (sum(vals) / len(vals)) if vals else 0.0
+        chosen_label = max(top_labels, key=lambda lbl: avg_conf_by_label.get(lbl, 0.0))
+    else:
+        chosen_label = top_labels[0]
+
+    label_runs = [r for r in runs if r.get("result_summary") == chosen_label]
+    chosen_run = max(label_runs, key=lambda r: float(r.get("pipeline_conf", 0.0)))
+    return chosen_run, chosen_label, dict(counts)
+
+
 def _finalize_track_event(
     track: TrackState,
     models: ModelBundle,
@@ -664,9 +700,26 @@ def _finalize_track_event(
     events_jsonl_path: Path,
     events_images_dir: Path,
     final_reason: str,
+    vote_enable: bool,
+    vote_every_n_frames: int,
     logger,
 ) -> dict[str, Any]:
-    if event_infer_mode == "finalize":
+    if vote_enable:
+        vote_candidates = list(track.vote_candidates)
+        if not vote_candidates and track.best_candidate is not None:
+            vote_candidates = [track.best_candidate]
+        track.inference_runs = []
+        for candidate in vote_candidates:
+            run = _run_heavy_phases_on_crop(candidate, models, seg_conf_threshold)
+            track.inference_runs.append(
+                {
+                    "candidate_frame": candidate.frame_idx,
+                    "candidate_score": candidate.score,
+                    "candidate": candidate,
+                    **run,
+                }
+            )
+    elif event_infer_mode == "finalize":
         if track.best_candidate is not None:
             run = _run_heavy_phases_on_crop(track.best_candidate, models, seg_conf_threshold)
             track.inference_runs.append(
@@ -735,15 +788,19 @@ def _finalize_track_event(
             f.write(json.dumps(empty_event) + "\n")
         return empty_event
 
-    best_run = max(track.inference_runs, key=lambda r: float(r.get("pipeline_conf", 0.0)))
+    if vote_enable:
+        best_run, result_summary, vote_counts = _majority_vote_run(track.inference_runs)
+    else:
+        best_run = max(track.inference_runs, key=lambda r: float(r.get("pipeline_conf", 0.0)))
+        result_summary = _build_result_summary(
+            coverage=best_run.get("coverage"),
+            shape=best_run.get("shape"),
+            irregular_type=best_run.get("irregular_type"),
+            segmentation=best_run.get("segmentation"),
+        )
+        vote_counts = {}
     selected_candidate: CropCandidate = best_run["candidate"]
 
-    result_summary = _build_result_summary(
-        coverage=best_run.get("coverage"),
-        shape=best_run.get("shape"),
-        irregular_type=best_run.get("irregular_type"),
-        segmentation=best_run.get("segmentation"),
-    )
     raw_crop_path = events_images_dir / f"event_{track.track_id:05d}_bed_crop.jpg"
     cv2.imwrite(str(raw_crop_path), selected_candidate.crop_bgr)
     overlay_text = f"event={track.track_id} {result_summary} violation={best_run.get('violation', False)}"
@@ -771,6 +828,13 @@ def _finalize_track_event(
             "overlay_image": str(overlay_path),
         },
         "heavy_inference_calls": len(track.inference_runs),
+        "vote": {
+            "enabled": bool(vote_enable),
+            "sample_every_frames": int(vote_every_n_frames),
+            "samples_used": len(track.inference_runs),
+            "counts": vote_counts,
+            "winner": result_summary,
+        },
     }
     with events_jsonl_path.open("a", encoding="utf-8") as f:
         f.write(json.dumps(event) + "\n")
@@ -792,10 +856,11 @@ def _finalize_track_event(
     banner = "=" * max(100, len(event_line))
     print(f"\n\033[1m{banner}\n{event_line}\n{banner}\033[0m")
     logger.info(
-        "Finalized event %s with %s heavy call(s), violation=%s",
+        "Finalized event %s with %s heavy call(s), violation=%s vote=%s",
         event["event_id"],
         event["heavy_inference_calls"],
         event["violation"],
+        "on" if vote_enable else "off",
     )
     return event
 
@@ -830,6 +895,9 @@ def run_stream_event(
     summary_only: bool = False,
     min_event_hits: int = config.STREAM_MIN_EVENT_HITS,
     min_bed_persist_frames: int = config.STREAM_MIN_BED_PERSIST_FRAMES,
+    vote_enable: bool = config.STREAM_VOTE_ENABLE,
+    vote_every_n_frames: int = config.STREAM_VOTE_EVERY_N_FRAMES,
+    vote_max_samples: int = config.STREAM_VOTE_MAX_SAMPLES,
     track_smooth_alpha: float = config.STREAM_TRACK_SMOOTH_ALPHA,
     track_deadband_px: float = config.STREAM_TRACK_DEADBAND_PX,
     track_max_step_px: float = config.STREAM_TRACK_MAX_STEP_PX,
@@ -846,6 +914,9 @@ def run_stream_event(
 
     if event_infer_mode not in {"finalize", "early"}:
         raise ValueError("event_infer_mode must be one of: finalize, early")
+    if vote_enable and event_infer_mode != "finalize":
+        logger.warning("vote_enable=1 works with finalize mode; forcing event_infer_mode=finalize.")
+        event_infer_mode = "finalize"
     if top2:
         # Requirement: keep only one selected frame per truck (best centered frame).
         top2 = False
@@ -862,6 +933,9 @@ def run_stream_event(
     stable_frames = max(1, int(stable_frames))
     min_event_hits = max(1, int(min_event_hits))
     min_bed_persist_frames = max(1, int(min_bed_persist_frames))
+    vote_enable = bool(vote_enable)
+    vote_every_n_frames = max(1, int(vote_every_n_frames))
+    vote_max_samples = max(1, int(vote_max_samples))
     track_smooth_alpha = float(max(0.01, min(1.0, track_smooth_alpha)))
     track_deadband_px = float(max(0.0, track_deadband_px))
     track_max_step_px = float(max(0.0, track_max_step_px))
@@ -942,7 +1016,8 @@ def run_stream_event(
     logger.info(
         "Starting stream_event on %s | every_n=%s | missed_M=%s | iou_threshold=%.3f | "
         "merge_window=%s merge_iou=%.3f merge_center_ratio=%.3f edge_guard=%s edge_margin=%s | "
-        "infer_mode=%s | top2=%s | smooth_alpha=%.2f deadband=%.1f max_step=%.1f max_detect_fps=%.2f",
+        "infer_mode=%s | top2=%s | vote=%s vote_every=%s vote_max_samples=%s | "
+        "smooth_alpha=%.2f deadband=%.1f max_step=%.1f max_detect_fps=%.2f",
         video,
         every_n,
         missed_M,
@@ -954,6 +1029,9 @@ def run_stream_event(
         edge_margin,
         event_infer_mode,
         int(top2),
+        int(vote_enable),
+        vote_every_n_frames,
+        vote_max_samples,
         track_smooth_alpha,
         track_deadband_px,
         track_max_step_px,
@@ -1064,6 +1142,13 @@ def run_stream_event(
                     crop_bgr=crop.copy(),
                 )
                 best_updated = tracker.add_candidate(track.track_id, candidate)
+                if vote_enable:
+                    tracker.add_vote_candidate(
+                        track_id=track.track_id,
+                        candidate=candidate,
+                        sample_every_frames=vote_every_n_frames,
+                        max_samples=vote_max_samples,
+                    )
 
                 if area >= min_best_area:
                     track.stable_count += 1
@@ -1138,6 +1223,8 @@ def run_stream_event(
                     events_jsonl_path=events_jsonl,
                     events_images_dir=events_images_dir,
                     final_reason="missed_M_frames",
+                    vote_enable=vote_enable,
+                    vote_every_n_frames=vote_every_n_frames,
                     logger=logger,
                 )
                 events_finalized += 1
@@ -1206,6 +1293,8 @@ def run_stream_event(
                     events_jsonl_path=events_jsonl,
                     events_images_dir=events_images_dir,
                     final_reason="end_of_video",
+                    vote_enable=vote_enable,
+                    vote_every_n_frames=vote_every_n_frames,
                     logger=logger,
                 )
                 events_finalized += 1
