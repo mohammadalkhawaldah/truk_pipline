@@ -190,6 +190,8 @@ class IoUTracker:
         merge_window_frames: int = 10,
         merge_iou_threshold: float = 0.20,
         merge_center_dist_ratio: float = 0.15,
+        active_match_center_dist_ratio: float = 0.08,
+        duplicate_iou_threshold: float = 0.85,
         edge_guard: bool = True,
         edge_margin: int = 80,
         recently_lost_maxlen: int = 256,
@@ -203,6 +205,8 @@ class IoUTracker:
         self.merge_window_frames = int(max(1, merge_window_frames))
         self.merge_iou_threshold = float(max(0.0, min(1.0, merge_iou_threshold)))
         self.merge_center_dist_ratio = float(max(0.0, merge_center_dist_ratio))
+        self.active_match_center_dist_ratio = float(max(0.0, active_match_center_dist_ratio))
+        self.duplicate_iou_threshold = float(max(0.0, min(1.0, duplicate_iou_threshold)))
         self.edge_guard = bool(edge_guard)
         self.edge_margin = int(max(0, edge_margin))
 
@@ -310,7 +314,11 @@ class IoUTracker:
         self,
         detections: list[Detection],
         frame_idx: int,
+        frame_shape: tuple[int, int],
     ) -> list[tuple[int, Detection, bool]]:
+        frame_h, frame_w = frame_shape
+        frame_diag = max(1.0, float((frame_w ** 2 + frame_h ** 2) ** 0.5))
+        max_center_dist = self.active_match_center_dist_ratio * frame_diag
         for track in self.active_tracks.values():
             track.matched_in_update = False
 
@@ -319,15 +327,24 @@ class IoUTracker:
 
         for det in sorted(detections, key=lambda d: d.conf, reverse=True):
             best_track_id = None
-            best_iou = -1.0
+            best_key = (False, -1.0, float("-inf"), float("-inf"))
             for track_id, track in self.active_tracks.items():
                 if track_id in assigned_tracks:
                     continue
                 iou = iou_xyxy(det.xyxy, track.raw_truck_box_xyxy)
-                if iou < self.iou_threshold:
+                dist = center_distance(det.xyxy, track.raw_truck_box_xyxy)
+                matched_by_iou = iou >= self.iou_threshold
+                matched_by_center = dist <= max_center_dist
+                if not matched_by_iou and not matched_by_center:
                     continue
-                if iou > best_iou:
-                    best_iou = iou
+                candidate_key = (
+                    matched_by_iou,
+                    iou,
+                    -dist,
+                    float(track.total_hits),
+                )
+                if candidate_key > best_key:
+                    best_key = candidate_key
                     best_track_id = track_id
 
             if best_track_id is None:
@@ -368,6 +385,106 @@ class IoUTracker:
             matches.append((best_track_id, det, False))
         return matches
 
+    def _merge_track_state(self, dst: TrackState, src: TrackState) -> None:
+        dst.start_frame = min(dst.start_frame, src.start_frame)
+        dst.last_seen_frame = max(dst.last_seen_frame, src.last_seen_frame)
+        dst.total_hits += max(0, src.total_hits)
+        dst.bed_hits += max(0, src.bed_hits)
+        dst.stable_count = max(dst.stable_count, src.stable_count)
+        dst.max_area_seen = max(dst.max_area_seen, src.max_area_seen)
+        dst.last_area = max(dst.last_area, src.last_area)
+        dst.last_conf = max(dst.last_conf, src.last_conf)
+
+        if dst.best_candidate is None or (
+            src.best_candidate is not None and src.best_candidate.score > dst.best_candidate.score
+        ):
+            dst.best_candidate = src.best_candidate
+            if src.best_image_path:
+                dst.best_image_path = src.best_image_path
+
+        merged_top: list[CropCandidate] = []
+        seen_frames: set[int] = set()
+        for c in sorted(dst.top_candidates + src.top_candidates, key=lambda x: x.score, reverse=True):
+            if c.frame_idx in seen_frames:
+                continue
+            merged_top.append(c)
+            seen_frames.add(c.frame_idx)
+            if len(merged_top) >= self.keep_top_k:
+                break
+        dst.top_candidates = merged_top
+
+        vote_keep = max(len(dst.vote_candidates), len(src.vote_candidates), 1)
+        merged_votes = sorted(dst.vote_candidates + src.vote_candidates, key=lambda c: c.frame_idx)
+        if merged_votes:
+            dst.vote_candidates = merged_votes[-vote_keep:]
+            dst.last_vote_sample_frame = max(c.frame_idx for c in dst.vote_candidates)
+        elif src.last_vote_sample_frame is not None:
+            dst.last_vote_sample_frame = src.last_vote_sample_frame
+
+        if src.inference_runs:
+            existing_frames = {int(r.get("candidate_frame", -1)) for r in dst.inference_runs}
+            for run in src.inference_runs:
+                fidx = int(run.get("candidate_frame", -1))
+                if fidx in existing_frames:
+                    continue
+                dst.inference_runs.append(run)
+                existing_frames.add(fidx)
+        if dst.phase_results is None and src.phase_results is not None:
+            dst.phase_results = src.phase_results
+        if dst.best_image_path is None and src.best_image_path is not None:
+            dst.best_image_path = src.best_image_path
+
+    def _pick_keep_drop(self, a: TrackState, b: TrackState) -> tuple[TrackState, TrackState]:
+        def rank(t: TrackState) -> tuple[int, int, float, int, int]:
+            x1, y1, x2, y2 = t.raw_truck_box_xyxy
+            area = max(0, (x2 - x1) * (y2 - y1))
+            return (t.total_hits, t.bed_hits, t.last_conf, area, -t.track_id)
+
+        if rank(a) >= rank(b):
+            return a, b
+        return b, a
+
+    def _suppress_duplicate_tracks(
+        self,
+        frame_idx: int,
+        frame_shape: tuple[int, int],
+    ) -> list[str]:
+        _frame_h, _frame_w = frame_shape
+        matched_ids = [
+            tid
+            for tid, t in self.active_tracks.items()
+            if t.matched_in_update and t.last_seen_frame == frame_idx
+        ]
+        if len(matched_ids) < 2:
+            return []
+
+        logs: list[str] = []
+        remove_ids: set[int] = set()
+        sorted_ids = sorted(matched_ids)
+        for i, a_id in enumerate(sorted_ids):
+            if a_id in remove_ids or a_id not in self.active_tracks:
+                continue
+            for b_id in sorted_ids[i + 1 :]:
+                if b_id in remove_ids or b_id not in self.active_tracks:
+                    continue
+                a = self.active_tracks[a_id]
+                b = self.active_tracks[b_id]
+                iou = iou_xyxy(a.raw_truck_box_xyxy, b.raw_truck_box_xyxy)
+                if iou < self.duplicate_iou_threshold:
+                    continue
+                keep, drop = self._pick_keep_drop(a, b)
+                self._merge_track_state(dst=keep, src=drop)
+                remove_ids.add(drop.track_id)
+                logs.append(
+                    f"DEDUP: merged duplicate active track ID={drop.track_id} into ID={keep.track_id} "
+                    f"(iou={iou:.3f})"
+                )
+
+        for tid in sorted(remove_ids):
+            self.active_tracks.pop(tid, None)
+            self._remove_lost_snapshot(tid)
+        return logs
+
     def update(
         self,
         detections: list[Detection],
@@ -376,7 +493,11 @@ class IoUTracker:
     ) -> tuple[dict[int, TrackState], list[TrackState], list[str]]:
         frame_h, frame_w = frame_shape
         merge_logs: list[str] = []
-        matches = self._match_detections_to_tracks(detections=detections, frame_idx=frame_idx)
+        matches = self._match_detections_to_tracks(
+            detections=detections,
+            frame_idx=frame_idx,
+            frame_shape=frame_shape,
+        )
         matched_boxes = {det.xyxy for _, det, _ in matches}
 
         for det in sorted(detections, key=lambda d: d.conf, reverse=True):
@@ -407,6 +528,8 @@ class IoUTracker:
             new_track = self._create_track(det=det, frame_idx=frame_idx, track_id=None)
             new_track.matched_in_update = True
             matches.append((new_track.track_id, det, True))
+
+        merge_logs.extend(self._suppress_duplicate_tracks(frame_idx=frame_idx, frame_shape=frame_shape))
 
         for track in self.active_tracks.values():
             if track.matched_in_update:

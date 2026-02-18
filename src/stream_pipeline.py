@@ -901,6 +901,8 @@ def run_stream_event(
     track_smooth_alpha: float = config.STREAM_TRACK_SMOOTH_ALPHA,
     track_deadband_px: float = config.STREAM_TRACK_DEADBAND_PX,
     track_max_step_px: float = config.STREAM_TRACK_MAX_STEP_PX,
+    active_match_center_dist_ratio: float = config.STREAM_ACTIVE_MATCH_CENTER_RATIO,
+    duplicate_iou_threshold: float = config.STREAM_DUPLICATE_IOU_THRESHOLD,
     max_frames: int | None = None,
 ) -> bool:
     ensure_dirs([config.OUTPUT_DIR, config.STREAM_EVENTS_IMAGES_DIR, config.PROJECT_ROOT / "logs"])
@@ -939,6 +941,8 @@ def run_stream_event(
     track_smooth_alpha = float(max(0.01, min(1.0, track_smooth_alpha)))
     track_deadband_px = float(max(0.0, track_deadband_px))
     track_max_step_px = float(max(0.0, track_max_step_px))
+    active_match_center_dist_ratio = float(max(0.0, active_match_center_dist_ratio))
+    duplicate_iou_threshold = float(max(0.0, min(1.0, duplicate_iou_threshold)))
 
     detect_conf = config.DETECT_CONF_THRESHOLD if detect_conf_threshold is None else float(detect_conf_threshold)
     seg_conf = config.PHASE5_SEG_CONF_THRESHOLD if seg_conf_threshold is None else float(seg_conf_threshold)
@@ -1009,6 +1013,8 @@ def run_stream_event(
         merge_window_frames=merge_window_frames,
         merge_iou_threshold=merge_iou_threshold,
         merge_center_dist_ratio=merge_center_dist_ratio,
+        active_match_center_dist_ratio=active_match_center_dist_ratio,
+        duplicate_iou_threshold=duplicate_iou_threshold,
         edge_guard=edge_guard,
         edge_margin=edge_margin,
     )
@@ -1017,7 +1023,7 @@ def run_stream_event(
         "Starting stream_event on %s | every_n=%s | missed_M=%s | iou_threshold=%.3f | "
         "merge_window=%s merge_iou=%.3f merge_center_ratio=%.3f edge_guard=%s edge_margin=%s | "
         "infer_mode=%s | top2=%s | vote=%s vote_every=%s vote_max_samples=%s | "
-        "smooth_alpha=%.2f deadband=%.1f max_step=%.1f max_detect_fps=%.2f",
+        "smooth_alpha=%.2f deadband=%.1f max_step=%.1f active_center_ratio=%.3f dup_iou=%.2f max_detect_fps=%.2f",
         video,
         every_n,
         missed_M,
@@ -1035,6 +1041,8 @@ def run_stream_event(
         track_smooth_alpha,
         track_deadband_px,
         track_max_step_px,
+        active_match_center_dist_ratio,
+        duplicate_iou_threshold,
         max_detect_fps,
     )
 
@@ -1130,6 +1138,9 @@ def run_stream_event(
                     continue
 
                 area = max(0, (bx2 - bx1) * (by2 - by1))
+                if area < min_best_area:
+                    track.stable_count = 0
+                    continue
                 centeredness = _compute_centeredness((bx1, by1, bx2, by2), frame_w, frame_h)
                 score = _calc_candidate_score_center_only(centeredness=centeredness, conf=track.bed_conf)
                 candidate = CropCandidate(
@@ -1150,10 +1161,7 @@ def run_stream_event(
                         max_samples=vote_max_samples,
                     )
 
-                if area >= min_best_area:
-                    track.stable_count += 1
-                else:
-                    track.stable_count = 0
+                track.stable_count += 1
 
                 if best_updated:
                     debug_frame = frame.copy()
@@ -1212,6 +1220,15 @@ def run_stream_event(
                         track.bed_hits,
                         min_event_hits,
                         min_bed_persist_frames,
+                    )
+                    continue
+                best_area = int(track.best_candidate.area) if track.best_candidate is not None else 0
+                if track.best_candidate is None or best_area < min_best_area:
+                    logger.info(
+                        "Dropping low-quality track %s (best_area=%s, min_best_area=%s)",
+                        track.track_id,
+                        best_area,
+                        min_best_area,
                     )
                     continue
                 event = _finalize_track_event(
@@ -1281,6 +1298,16 @@ def run_stream_event(
                         track.bed_hits,
                         min_event_hits,
                         min_bed_persist_frames,
+                    )
+                    tracker.active_tracks.pop(track_id, None)
+                    continue
+                best_area = int(track.best_candidate.area) if track.best_candidate is not None else 0
+                if track.best_candidate is None or best_area < min_best_area:
+                    logger.info(
+                        "Dropping low-quality track %s at EOF (best_area=%s, min_best_area=%s)",
+                        track.track_id,
+                        best_area,
+                        min_best_area,
                     )
                     tracker.active_tracks.pop(track_id, None)
                     continue
