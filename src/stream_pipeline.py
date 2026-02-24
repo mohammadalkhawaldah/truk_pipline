@@ -47,6 +47,13 @@ def _normalize_label(label: str) -> str:
     return " ".join(label.replace("_", " ").replace("-", " ").lower().split())
 
 
+def _format_irregular_label(label: str) -> str:
+    text = str(label).strip()
+    if text == "":
+        return ""
+    return text.replace(" ", "_").lower()
+
+
 def _names_to_dict(names: Any) -> dict[int, str]:
     if isinstance(names, dict):
         return {int(k): str(v) for k, v in names.items()}
@@ -256,10 +263,10 @@ def _draw_active_tracks_overlay(
         if x2 <= x1 or y2 <= y1:
             continue
 
-        # Truck anchor
+        # Truck anchor (blue-ish)
         cv2.rectangle(display_frame, (x1, y1), (x2, y2), (255, 100, 0), 2)
 
-        # Bed child if available
+        # Bed child (green) if available
         if track.bed_box_xyxy is not None:
             bx1, by1, bx2, by2 = clamp_xyxy(*track.bed_box_xyxy, frame_w, frame_h)
             if bx2 > bx1 and by2 > by1:
@@ -270,7 +277,7 @@ def _draw_active_tracks_overlay(
         if warming:
             color = (140, 140, 140)
         elif stale:
-            color = (0, 200, 255)
+            color = (0, 80, 255)
         else:
             color = (0, 200, 0)
 
@@ -295,7 +302,7 @@ def _draw_active_tracks_overlay(
 def _candidate_to_overlay_image(candidate: CropCandidate, text: str, out_path: Path) -> str:
     crop = candidate.crop_bgr.copy()
     cv2.rectangle(crop, (0, 0), (crop.shape[1], 38), (0, 0, 0), -1)
-    cv2.putText(crop, text, (8, 26), cv2.FONT_HERSHEY_SIMPLEX, 0.62, (0, 255, 255), 2, cv2.LINE_AA)
+    cv2.putText(crop, text, (8, 26), cv2.FONT_HERSHEY_SIMPLEX, 0.62, (255, 255, 255), 2, cv2.LINE_AA)
     cv2.imwrite(str(out_path), crop)
     return str(out_path)
 
@@ -333,21 +340,35 @@ def _infer_irregular_type(
     iron_ids: list[int],
     unknown_ids: list[int],
 ) -> str | None:
+    formatted = _format_irregular_label(label)
     if sand_ids and pred_idx in sand_ids:
-        return "sand_like"
+        return formatted if formatted else "sand_like"
     if iron_ids and pred_idx in iron_ids:
-        return "ironbars_like"
+        return formatted if formatted else "ironbars_like"
     if unknown_ids and pred_idx in unknown_ids:
-        return "unknown"
+        return formatted if formatted else "unknown"
 
     n = _normalize_label(label)
     if "sand" in n:
-        return "sand_like"
+        return formatted if formatted else "sand_like"
     if "iron" in n or "bar" in n:
-        return "ironbars_like"
+        return formatted if formatted else "ironbars_like"
     if "irregular" in n or "unknown" in n:
-        return "unknown"
+        return formatted if formatted else "unknown"
+    if formatted:
+        return formatted
     return None
+
+
+def _compose_covered_irregular_status(irregular_type: dict[str, Any] | None) -> str:
+    if irregular_type is None:
+        return "covered_irregular_unknown"
+    irr = str(irregular_type.get("irregular_type", "unknown")).strip().lower()
+    if irr == "":
+        return "covered_irregular_unknown"
+    if irr.startswith("covered_"):
+        return irr
+    return f"covered_irregular_{irr}"
 
 
 def _parse_segmentation(result, names: dict[int, str]) -> dict[str, Any]:
@@ -428,9 +449,7 @@ def _build_result_summary(
             return "covered_unknown_shape"
         if not bool(shape.get("is_irregular", False)):
             return "covered_regular"
-        if irregular_type is None:
-            return "covered_irregular_unknown"
-        return f"covered_irregular_{irregular_type.get('irregular_type', 'unknown')}"
+        return _compose_covered_irregular_status(irregular_type)
 
     seg_label = "unknown"
     if segmentation is not None:
@@ -450,9 +469,7 @@ def _event_cover_status(
     if shape is None:
         return "covered_unknown_shape"
     if bool(shape.get("is_irregular", False)):
-        if irregular_type is None:
-            return "covered_irregular"
-        return f"covered_irregular_{irregular_type.get('irregular_type', 'unknown')}"
+        return _compose_covered_irregular_status(irregular_type)
     return "covered_regular"
 
 
@@ -536,6 +553,8 @@ def _run_heavy_phases_on_crop(candidate: CropCandidate, models: ModelBundle, seg
                 models.unknown_ids,
             )
             if irr_type is None:
+                irr_type = _format_irregular_label(cls3_label)
+            if irr_type == "":
                 irr_type = "unknown"
             irregular_type = {
                 "pred_idx": cls3_idx,
@@ -1081,7 +1100,7 @@ def run_stream_event(
                         (12, 28),
                         cv2.FONT_HERSHEY_SIMPLEX,
                         0.62,
-                        (0, 255, 255),
+                        (255, 255, 255),
                         2,
                         cv2.LINE_AA,
                     )
@@ -1268,7 +1287,7 @@ def run_stream_event(
                     (10, 25),
                     cv2.FONT_HERSHEY_SIMPLEX,
                     0.65,
-                    (0, 255, 255),
+                    (255, 255, 255),
                     2,
                     cv2.LINE_AA,
                 )

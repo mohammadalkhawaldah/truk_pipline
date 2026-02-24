@@ -32,6 +32,12 @@ def _normalize_label(label: str) -> str:
 def _score_cls1_candidate(path: Path) -> int:
     lower = str(path).lower()
     score = 0
+    if "classification#1_new1" in lower:
+        score += 24
+    if "covered_uncovered_cls_best" in lower:
+        score += 20
+    if "new1" in lower:
+        score += 8
     if "classification#1" in lower or "classification1" in lower:
         score += 12
     if "cls1" in lower:

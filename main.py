@@ -19,7 +19,7 @@ def parse_args() -> argparse.Namespace:
         "--mode",
         type=str,
         choices=["phase", "stream_event"],
-        default="phase",
+        default="stream_event",
         help="Execution mode: phase-by-phase image mode or event-based stream mode.",
     )
     parser.add_argument(

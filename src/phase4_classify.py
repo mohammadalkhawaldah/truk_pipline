@@ -33,6 +33,12 @@ def _normalize_label(label: str) -> str:
 def _score_cls3_candidate(path: Path) -> int:
     lower = str(path).lower()
     score = 0
+    if "classification#3_new1" in lower:
+        score += 24
+    if "5classes" in lower:
+        score += 16
+    if "new1" in lower:
+        score += 8
     if "classification#3" in lower or "classification3" in lower:
         score += 12
     if "cls3" in lower:
@@ -159,6 +165,14 @@ def _infer_irregular_type_from_label(label: str) -> str | None:
     if "irregular" in normalized or "unknown" in normalized or "other" in normalized:
         return "unknown"
     return None
+
+
+def _format_irregular_label(label: str) -> str:
+    # Keep model label semantics visible in summaries/events while staying CSV-safe.
+    text = str(label).strip()
+    if text == "":
+        return ""
+    return text.replace(" ", "_").lower()
 
 
 def _parse_bool(value: Any) -> bool:
@@ -297,17 +311,22 @@ def run_phase4(
         irregular_type: str | None = None
         decision_source = ""
         if sand_ids and pred_idx in sand_ids:
-            irregular_type = "sand_like"
+            irregular_type = _format_irregular_label(pred_label)
             decision_source = "mapped_class_id"
         elif iron_ids and pred_idx in iron_ids:
-            irregular_type = "ironbars_like"
+            irregular_type = _format_irregular_label(pred_label)
             decision_source = "mapped_class_id"
         elif unknown_ids and pred_idx in unknown_ids:
-            irregular_type = "unknown"
+            irregular_type = _format_irregular_label(pred_label)
             decision_source = "mapped_class_id"
         else:
-            irregular_type = _infer_irregular_type_from_label(pred_label)
-            decision_source = "label_heuristic"
+            inferred = _infer_irregular_type_from_label(pred_label)
+            if inferred is not None:
+                irregular_type = _format_irregular_label(pred_label)
+                decision_source = "label_heuristic"
+            else:
+                irregular_type = _format_irregular_label(pred_label)
+                decision_source = "label_passthrough"
 
         if irregular_type is None:
             failures.append(f"{crop_path.name}: unable to map label '{pred_label}' to irregular subtype.")
@@ -420,4 +439,3 @@ def run_phase4(
 
     logger.info("PHASE 4 PASSED")
     return True
-
