@@ -4,7 +4,7 @@ import json
 import logging
 import math
 import re
-from collections import Counter
+from collections import Counter, deque
 from datetime import datetime
 from dataclasses import dataclass
 from pathlib import Path
@@ -273,15 +273,20 @@ def _draw_active_tracks_overlay(
                 cv2.rectangle(display_frame, (bx1, by1), (bx2, by2), (0, 220, 0), 2)
 
         warming = track.bed_hits < min_bed_persist_frames
+        tentative = not track.is_confirmed
         stale = track.missed_count > 0
-        if warming:
+        if tentative:
+            color = (120, 120, 120)
+        elif warming:
             color = (140, 140, 140)
         elif stale:
             color = (0, 80, 255)
         else:
             color = (0, 200, 0)
 
-        if warming:
+        if tentative:
+            label = f"ID:{track_id} tentative {track.total_hits}"
+        elif warming:
             label = f"ID:{track_id} warming {track.bed_hits}/{min_bed_persist_frames}"
         else:
             label = f"ID:{track_id} conf:{track.last_conf:.2f} bed_hits:{track.bed_hits}"
@@ -493,12 +498,33 @@ def _format_event_console_line(
     event_id: int,
     cover_status: str,
     material: str,
-    violation: bool,
+    violation_display: str,
 ) -> str:
     return (
         f"{ts} | TRUCK_ID={event_id} | COVER_STATUS={cover_status} | "
-        f"MATERIAL={material} | VIOLATION={violation}"
+        f"MATERIAL={material} | VIOLATION={violation_display}"
     )
+
+
+def _event_violation_display(event: dict[str, Any]) -> str:
+    violation = bool(event.get("violation", False))
+    if not violation:
+        return "Under Investigation"
+
+    coverage = event.get("coverage")
+    shape = event.get("shape")
+    irregular_type = event.get("irregular_type")
+    from_phase4_cls = bool(
+        isinstance(coverage, dict)
+        and bool(coverage.get("is_fully_covered", False))
+        and isinstance(shape, dict)
+        and bool(shape.get("is_irregular", False))
+        and (irregular_type is not None)
+    )
+    if from_phase4_cls:
+        return "Under Investigation"
+
+    return "True"
 
 
 def _run_heavy_phases_on_crop(candidate: CropCandidate, models: ModelBundle, seg_conf_threshold: float) -> dict[str, Any]:
@@ -710,13 +736,111 @@ def _majority_vote_run(runs: list[dict[str, Any]]) -> tuple[dict[str, Any], str,
     return chosen_run, chosen_label, dict(counts)
 
 
+def _event_box_xyxy(event: dict[str, Any]) -> tuple[int, int, int, int] | None:
+    box = event.get("best_box_xyxy")
+    if not isinstance(box, list) or len(box) != 4:
+        return None
+    try:
+        return (int(box[0]), int(box[1]), int(box[2]), int(box[3]))
+    except Exception:
+        return None
+
+
+def _event_box_area(box: tuple[int, int, int, int]) -> int:
+    x1, y1, x2, y2 = box
+    return max(0, (x2 - x1) * (y2 - y1))
+
+
+def _event_center_distance(a: tuple[int, int, int, int], b: tuple[int, int, int, int]) -> float:
+    ax = (a[0] + a[2]) / 2.0
+    ay = (a[1] + a[3]) / 2.0
+    bx = (b[0] + b[2]) / 2.0
+    by = (b[1] + b[3]) / 2.0
+    return float(math.sqrt((ax - bx) ** 2 + (ay - by) ** 2))
+
+
+def _find_dedup_target_event(
+    candidate_event: dict[str, Any],
+    recent_events: deque[dict[str, Any]],
+    frame_shape: tuple[int, int] | None,
+    window_frames: int,
+    iou_threshold: float,
+    center_dist_ratio: float,
+) -> tuple[dict[str, Any], float, float] | None:
+    candidate_box = _event_box_xyxy(candidate_event)
+    if candidate_box is None:
+        return None
+    c_start = int(candidate_event.get("start_frame", -1))
+    c_end = int(candidate_event.get("end_frame", -1))
+    if c_end < 0:
+        return None
+
+    frame_h, frame_w = frame_shape if frame_shape is not None else (0, 0)
+    frame_diag = max(1.0, float(math.sqrt((frame_w ** 2) + (frame_h ** 2))))
+    max_center_dist = float(max(0.0, center_dist_ratio)) * frame_diag
+    candidate_area = _event_box_area(candidate_box)
+
+    for prev in reversed(recent_events):
+        p_start = int(prev.get("start_frame", -1))
+        p_end = int(prev.get("end_frame", -1))
+        if p_end < 0:
+            continue
+        if (c_start - p_end) > window_frames:
+            break
+        if (p_start - c_end) > window_frames:
+            continue
+
+        prev_box = _event_box_xyxy(prev)
+        if prev_box is None:
+            continue
+
+        iou = iou_xyxy(candidate_box, prev_box)
+        dist = _event_center_distance(candidate_box, prev_box)
+        prev_area = _event_box_area(prev_box)
+        area_ratio = (
+            float(min(candidate_area, prev_area)) / float(max(1, max(candidate_area, prev_area)))
+        )
+        if iou >= iou_threshold or (dist <= max_center_dist and area_ratio >= 0.60):
+            return prev, float(iou), float(dist)
+    return None
+
+
+def _emit_event(event: dict[str, Any], events_jsonl_path: Path, logger) -> None:
+    with events_jsonl_path.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(event) + "\n")
+
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    cover_status = _event_cover_status(
+        coverage=event.get("coverage"),
+        shape=event.get("shape"),
+        irregular_type=event.get("irregular_type"),
+    )
+    material = _event_material(event.get("segmentation"))
+    violation_display = _event_violation_display(event)
+    event_line = _format_event_console_line(
+        ts=ts,
+        event_id=int(event["event_id"]),
+        cover_status=cover_status,
+        material=material,
+        violation_display=violation_display,
+    )
+    banner = "=" * max(100, len(event_line))
+    print(f"\n\033[1m{banner}\n{event_line}\n{banner}\033[0m")
+    logger.info(
+        "Finalized event %s with %s heavy call(s), violation=%s vote=%s",
+        event["event_id"],
+        event.get("heavy_inference_calls", 0),
+        event.get("violation", False),
+        "on" if bool(event.get("vote", {}).get("enabled", False)) else "off",
+    )
+
+
 def _finalize_track_event(
     track: TrackState,
     models: ModelBundle,
     event_infer_mode: str,
     top2: bool,
     seg_conf_threshold: float,
-    events_jsonl_path: Path,
     events_images_dir: Path,
     final_reason: str,
     vote_enable: bool,
@@ -803,8 +927,6 @@ def _finalize_track_event(
             "artifacts": {},
             "heavy_inference_calls": 0,
         }
-        with events_jsonl_path.open("a", encoding="utf-8") as f:
-            f.write(json.dumps(empty_event) + "\n")
         return empty_event
 
     if vote_enable:
@@ -855,32 +977,6 @@ def _finalize_track_event(
             "winner": result_summary,
         },
     }
-    with events_jsonl_path.open("a", encoding="utf-8") as f:
-        f.write(json.dumps(event) + "\n")
-
-    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    cover_status = _event_cover_status(
-        coverage=event.get("coverage"),
-        shape=event.get("shape"),
-        irregular_type=event.get("irregular_type"),
-    )
-    material = _event_material(event.get("segmentation"))
-    event_line = _format_event_console_line(
-        ts=ts,
-        event_id=int(event["event_id"]),
-        cover_status=cover_status,
-        material=material,
-        violation=bool(event["violation"]),
-    )
-    banner = "=" * max(100, len(event_line))
-    print(f"\n\033[1m{banner}\n{event_line}\n{banner}\033[0m")
-    logger.info(
-        "Finalized event %s with %s heavy call(s), violation=%s vote=%s",
-        event["event_id"],
-        event["heavy_inference_calls"],
-        event["violation"],
-        "on" if vote_enable else "off",
-    )
     return event
 
 
@@ -917,11 +1013,16 @@ def run_stream_event(
     vote_enable: bool = config.STREAM_VOTE_ENABLE,
     vote_every_n_frames: int = config.STREAM_VOTE_EVERY_N_FRAMES,
     vote_max_samples: int = config.STREAM_VOTE_MAX_SAMPLES,
+    track_confirm_hits: int = config.STREAM_TRACK_CONFIRM_HITS,
     track_smooth_alpha: float = config.STREAM_TRACK_SMOOTH_ALPHA,
     track_deadband_px: float = config.STREAM_TRACK_DEADBAND_PX,
     track_max_step_px: float = config.STREAM_TRACK_MAX_STEP_PX,
     active_match_center_dist_ratio: float = config.STREAM_ACTIVE_MATCH_CENTER_RATIO,
     duplicate_iou_threshold: float = config.STREAM_DUPLICATE_IOU_THRESHOLD,
+    event_dedup_enable: bool = config.STREAM_EVENT_DEDUP_ENABLE,
+    event_dedup_window_frames: int = config.STREAM_EVENT_DEDUP_WINDOW_FRAMES,
+    event_dedup_iou_threshold: float = config.STREAM_EVENT_DEDUP_IOU_THRESHOLD,
+    event_dedup_center_dist_ratio: float = config.STREAM_EVENT_DEDUP_CENTER_DIST_RATIO,
     max_frames: int | None = None,
 ) -> bool:
     ensure_dirs([config.OUTPUT_DIR, config.STREAM_EVENTS_IMAGES_DIR, config.PROJECT_ROOT / "logs"])
@@ -957,11 +1058,16 @@ def run_stream_event(
     vote_enable = bool(vote_enable)
     vote_every_n_frames = max(1, int(vote_every_n_frames))
     vote_max_samples = max(1, int(vote_max_samples))
+    track_confirm_hits = max(1, int(track_confirm_hits))
     track_smooth_alpha = float(max(0.01, min(1.0, track_smooth_alpha)))
     track_deadband_px = float(max(0.0, track_deadband_px))
     track_max_step_px = float(max(0.0, track_max_step_px))
     active_match_center_dist_ratio = float(max(0.0, active_match_center_dist_ratio))
     duplicate_iou_threshold = float(max(0.0, min(1.0, duplicate_iou_threshold)))
+    event_dedup_enable = bool(event_dedup_enable)
+    event_dedup_window_frames = max(1, int(event_dedup_window_frames))
+    event_dedup_iou_threshold = float(max(0.0, min(1.0, event_dedup_iou_threshold)))
+    event_dedup_center_dist_ratio = float(max(0.0, event_dedup_center_dist_ratio))
 
     detect_conf = config.DETECT_CONF_THRESHOLD if detect_conf_threshold is None else float(detect_conf_threshold)
     seg_conf = config.PHASE5_SEG_CONF_THRESHOLD if seg_conf_threshold is None else float(seg_conf_threshold)
@@ -1025,6 +1131,7 @@ def run_stream_event(
     tracker = IoUTracker(
         iou_threshold=iou_threshold,
         missed_M=missed_M,
+        track_confirm_hits=track_confirm_hits,
         top2=top2,
         smooth_alpha=track_smooth_alpha,
         smooth_deadband_px=track_deadband_px,
@@ -1042,6 +1149,7 @@ def run_stream_event(
         "Starting stream_event on %s | every_n=%s | missed_M=%s | iou_threshold=%.3f | "
         "merge_window=%s merge_iou=%.3f merge_center_ratio=%.3f edge_guard=%s edge_margin=%s | "
         "infer_mode=%s | top2=%s | vote=%s vote_every=%s vote_max_samples=%s | "
+        "confirm_hits=%s | dedup=%s dedup_window=%s dedup_iou=%.2f dedup_center_ratio=%.3f | "
         "smooth_alpha=%.2f deadband=%.1f max_step=%.1f active_center_ratio=%.3f dup_iou=%.2f max_detect_fps=%.2f",
         video,
         every_n,
@@ -1057,6 +1165,11 @@ def run_stream_event(
         int(vote_enable),
         vote_every_n_frames,
         vote_max_samples,
+        track_confirm_hits,
+        int(event_dedup_enable),
+        event_dedup_window_frames,
+        event_dedup_iou_threshold,
+        event_dedup_center_dist_ratio,
         track_smooth_alpha,
         track_deadband_px,
         track_max_step_px,
@@ -1067,10 +1180,13 @@ def run_stream_event(
 
     frame_idx = -1
     events_finalized = 0
+    events_deduped = 0
     heavy_inference_calls_total = 0
     phase_calls_by_event: list[int] = []
+    recent_emitted_events: deque[dict[str, Any]] = deque(maxlen=512)
     detection_frames = 0
     max_frame_seen = -1
+    last_frame_shape: tuple[int, int] | None = None
 
     try:
         while True:
@@ -1121,6 +1237,7 @@ def run_stream_event(
             detection_frames += 1
             detect_result = models.detect.predict(source=frame, device="cpu", conf=detect_conf, verbose=False)[0]
             frame_h, frame_w = frame.shape[:2]
+            last_frame_shape = (frame_h, frame_w)
             detections = _extract_anchor_detections(
                 result=detect_result,
                 names=models.detect_names,
@@ -1141,6 +1258,8 @@ def run_stream_event(
 
             for track in list(active_tracks.values()):
                 if track.last_seen_frame != frame_idx:
+                    continue
+                if not track.is_confirmed:
                     continue
                 if track.bed_box_xyxy is None:
                     continue
@@ -1203,6 +1322,8 @@ def run_stream_event(
 
             if event_infer_mode == "early":
                 for track in list(active_tracks.values()):
+                    if not track.is_confirmed:
+                        continue
                     if track.bed_hits < min_bed_persist_frames:
                         continue
                     if not _should_early_infer(track, min_best_area=min_best_area, stable_frames=stable_frames):
@@ -1231,6 +1352,15 @@ def run_stream_event(
                     )
 
             for track in finalized_tracks:
+                if not track.is_confirmed:
+                    logger.info(
+                        "Dropping unconfirmed track %s (state=%s, hits=%s/%s)",
+                        track.track_id,
+                        track.track_state,
+                        track.total_hits,
+                        track.bed_hits,
+                    )
+                    continue
                 if track.total_hits < min_event_hits or track.bed_hits < min_bed_persist_frames:
                     logger.info(
                         "Dropping short/noisy track %s (truck_hits=%s, bed_hits=%s, min_event_hits=%s, min_bed_persist_frames=%s)",
@@ -1256,13 +1386,42 @@ def run_stream_event(
                     event_infer_mode=event_infer_mode,
                     top2=bool(top2),
                     seg_conf_threshold=seg_conf,
-                    events_jsonl_path=events_jsonl,
                     events_images_dir=events_images_dir,
                     final_reason="missed_M_frames",
                     vote_enable=vote_enable,
                     vote_every_n_frames=vote_every_n_frames,
                     logger=logger,
                 )
+                dedup_target = None
+                if event_dedup_enable:
+                    dedup_target = _find_dedup_target_event(
+                        candidate_event=event,
+                        recent_events=recent_emitted_events,
+                        frame_shape=last_frame_shape,
+                        window_frames=event_dedup_window_frames,
+                        iou_threshold=event_dedup_iou_threshold,
+                        center_dist_ratio=event_dedup_center_dist_ratio,
+                    )
+                if dedup_target is not None:
+                    prev_event, d_iou, d_dist = dedup_target
+                    events_deduped += 1
+                    logger.info(
+                        "EVENT_DEDUP dropped event_id=%s as duplicate of event_id=%s (iou=%.3f, center_dist=%.1f)",
+                        event.get("event_id"),
+                        prev_event.get("event_id"),
+                        d_iou,
+                        d_dist,
+                    )
+                    continue
+                _emit_event(event, events_jsonl_path=events_jsonl, logger=logger)
+                recent_emitted_events.append(event)
+                if recent_emitted_events:
+                    newest_end = int(event.get("end_frame", -1))
+                    while recent_emitted_events:
+                        oldest_end = int(recent_emitted_events[0].get("end_frame", -1))
+                        if newest_end - oldest_end <= event_dedup_window_frames:
+                            break
+                        recent_emitted_events.popleft()
                 events_finalized += 1
                 heavy_calls = int(event.get("heavy_inference_calls", 0))
                 heavy_inference_calls_total += heavy_calls
@@ -1309,6 +1468,16 @@ def run_stream_event(
                 track = tracker.active_tracks.get(track_id)
                 if track is None:
                     continue
+                if not track.is_confirmed:
+                    logger.info(
+                        "Dropping unconfirmed track %s at EOF (state=%s, hits=%s/%s)",
+                        track.track_id,
+                        track.track_state,
+                        track.total_hits,
+                        track.bed_hits,
+                    )
+                    tracker.active_tracks.pop(track_id, None)
+                    continue
                 if track.total_hits < min_event_hits or track.bed_hits < min_bed_persist_frames:
                     logger.info(
                         "Dropping short/noisy track %s at EOF (truck_hits=%s, bed_hits=%s, min_event_hits=%s, min_bed_persist_frames=%s)",
@@ -1336,13 +1505,43 @@ def run_stream_event(
                     event_infer_mode=event_infer_mode,
                     top2=bool(top2),
                     seg_conf_threshold=seg_conf,
-                    events_jsonl_path=events_jsonl,
                     events_images_dir=events_images_dir,
                     final_reason="end_of_video",
                     vote_enable=vote_enable,
                     vote_every_n_frames=vote_every_n_frames,
                     logger=logger,
                 )
+                dedup_target = None
+                if event_dedup_enable:
+                    dedup_target = _find_dedup_target_event(
+                        candidate_event=event,
+                        recent_events=recent_emitted_events,
+                        frame_shape=last_frame_shape,
+                        window_frames=event_dedup_window_frames,
+                        iou_threshold=event_dedup_iou_threshold,
+                        center_dist_ratio=event_dedup_center_dist_ratio,
+                    )
+                if dedup_target is not None:
+                    prev_event, d_iou, d_dist = dedup_target
+                    events_deduped += 1
+                    logger.info(
+                        "EVENT_DEDUP dropped EOF event_id=%s as duplicate of event_id=%s (iou=%.3f, center_dist=%.1f)",
+                        event.get("event_id"),
+                        prev_event.get("event_id"),
+                        d_iou,
+                        d_dist,
+                    )
+                    tracker.active_tracks.pop(track_id, None)
+                    continue
+                _emit_event(event, events_jsonl_path=events_jsonl, logger=logger)
+                recent_emitted_events.append(event)
+                if recent_emitted_events:
+                    newest_end = int(event.get("end_frame", -1))
+                    while recent_emitted_events:
+                        oldest_end = int(recent_emitted_events[0].get("end_frame", -1))
+                        if newest_end - oldest_end <= event_dedup_window_frames:
+                            break
+                        recent_emitted_events.popleft()
                 events_finalized += 1
                 heavy_calls = int(event.get("heavy_inference_calls", 0))
                 heavy_inference_calls_total += heavy_calls
@@ -1356,12 +1555,13 @@ def run_stream_event(
 
     avg_heavy = (sum(phase_calls_by_event) / len(phase_calls_by_event)) if phase_calls_by_event else 0.0
     logger.info(
-        "stream_event complete | detection_frames=%s total_tracks_created=%s merges=%s events_finalized=%s "
+        "stream_event complete | detection_frames=%s total_tracks_created=%s merges=%s events_finalized=%s deduped=%s "
         "heavy_calls_total=%s avg_heavy=%.3f",
         detection_frames,
         tracker.total_tracks_created,
         tracker.total_merges,
         events_finalized,
+        events_deduped,
         heavy_inference_calls_total,
         avg_heavy,
     )

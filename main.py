@@ -258,6 +258,12 @@ def parse_args() -> argparse.Namespace:
         help="Optional cap for detector run rate. 0 disables cap.",
     )
     parser.add_argument(
+        "--track-confirm-hits",
+        type=int,
+        default=config.STREAM_TRACK_CONFIRM_HITS,
+        help="Minimum matched detections before a track is considered confirmed.",
+    )
+    parser.add_argument(
         "--track-smooth-alpha",
         type=float,
         default=config.STREAM_TRACK_SMOOTH_ALPHA,
@@ -334,6 +340,31 @@ def parse_args() -> argparse.Namespace:
         help="Maximum number of sampled crops kept per track for voting.",
     )
     parser.add_argument(
+        "--event-dedup",
+        type=int,
+        choices=[0, 1],
+        default=1 if config.STREAM_EVENT_DEDUP_ENABLE else 0,
+        help="Enable event-level deduplication for near-duplicate finalized tracks.",
+    )
+    parser.add_argument(
+        "--event-dedup-window",
+        type=int,
+        default=config.STREAM_EVENT_DEDUP_WINDOW_FRAMES,
+        help="Look-back window in frames for event deduplication.",
+    )
+    parser.add_argument(
+        "--event-dedup-iou",
+        type=float,
+        default=config.STREAM_EVENT_DEDUP_IOU_THRESHOLD,
+        help="IoU threshold for considering two finalized events duplicates.",
+    )
+    parser.add_argument(
+        "--event-dedup-center-ratio",
+        type=float,
+        default=config.STREAM_EVENT_DEDUP_CENTER_DIST_RATIO,
+        help="Center-distance threshold ratio (of frame diagonal) for event deduplication.",
+    )
+    parser.add_argument(
         "--non-interactive-model-select",
         action="store_true",
         help="Disable interactive prompt if multiple models are found; highest-scored candidate is used.",
@@ -391,9 +422,14 @@ def main() -> int:
             vote_enable=bool(args.vote_enable),
             vote_every_n_frames=args.vote_every,
             vote_max_samples=args.vote_max_samples,
+            track_confirm_hits=args.track_confirm_hits,
             track_smooth_alpha=args.track_smooth_alpha,
             track_deadband_px=args.track_deadband_px,
             track_max_step_px=args.track_max_step_px,
+            event_dedup_enable=bool(args.event_dedup),
+            event_dedup_window_frames=args.event_dedup_window,
+            event_dedup_iou_threshold=args.event_dedup_iou,
+            event_dedup_center_dist_ratio=args.event_dedup_center_ratio,
         )
     else:
         if args.phase == "phase1":

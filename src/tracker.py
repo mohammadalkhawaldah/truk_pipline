@@ -46,6 +46,8 @@ class TrackState:
     stable_count: int = 0
     max_area_seen: int = 0
     last_area: int = 0
+    track_state: str = "tentative"  # tentative | confirmed
+    confirmed_frame: int | None = None
     smooth_truck_box_xyxy_f: tuple[float, float, float, float] | None = None
     best_candidate: CropCandidate | None = None
     top_candidates: list[CropCandidate] = field(default_factory=list)
@@ -64,16 +66,28 @@ class TrackState:
     def smooth_box_xyxy_f(self) -> tuple[float, float, float, float] | None:
         return self.smooth_truck_box_xyxy_f
 
+    @property
+    def is_confirmed(self) -> bool:
+        return self.track_state == "confirmed"
+
 
 @dataclass
 class LostTrackSnapshot:
     track_id: int
+    start_frame: int
     last_truck_box: tuple[int, int, int, int]
     last_seen_frame: int
+    total_hits: int
+    bed_hits: int
+    track_state: str
+    confirmed_frame: int | None
+    max_area_seen: int
+    last_area: int
     best_candidate: CropCandidate | None
     vote_candidates: list[CropCandidate]
     last_vote_sample_frame: int | None
     phase_results: dict[str, Any] | None
+    best_image_path: str | None
 
 
 def iou_xyxy(a: tuple[int, int, int, int], b: tuple[int, int, int, int]) -> float:
@@ -183,6 +197,7 @@ class IoUTracker:
         self,
         iou_threshold: float = 0.25,
         missed_M: int = 15,
+        track_confirm_hits: int = 4,
         top2: bool = False,
         smooth_alpha: float = 0.20,
         smooth_deadband_px: float = 4.0,
@@ -198,6 +213,7 @@ class IoUTracker:
     ) -> None:
         self.iou_threshold = float(iou_threshold)
         self.missed_M = int(missed_M)
+        self.track_confirm_hits = int(max(1, track_confirm_hits))
         self.keep_top_k = 2 if bool(top2) else 1
         self.smooth_alpha = float(max(0.01, min(1.0, smooth_alpha)))
         self.smooth_deadband_px = float(max(0.0, smooth_deadband_px))
@@ -216,6 +232,14 @@ class IoUTracker:
         self.total_tracks_created = 0
         self.total_merges = 0
 
+    def _update_track_state(self, track: TrackState, frame_idx: int) -> None:
+        if track.track_state == "confirmed":
+            return
+        if track.total_hits >= self.track_confirm_hits:
+            track.track_state = "confirmed"
+            if track.confirmed_frame is None:
+                track.confirmed_frame = int(frame_idx)
+
     def _create_track(self, det: Detection, frame_idx: int, track_id: int | None = None) -> TrackState:
         if track_id is None:
             track_id = self.next_track_id
@@ -226,6 +250,8 @@ class IoUTracker:
 
         tx1, ty1, tx2, ty2 = det.xyxy
         t_area = max(0, (tx2 - tx1) * (ty2 - ty1))
+        initial_state = "confirmed" if self.track_confirm_hits <= 1 else "tentative"
+        initial_confirmed_frame = frame_idx if initial_state == "confirmed" else None
         track = TrackState(
             track_id=track_id,
             start_frame=frame_idx,
@@ -237,9 +263,12 @@ class IoUTracker:
             last_conf=float(det.conf),
             max_area_seen=t_area,
             last_area=t_area,
+            track_state=initial_state,
+            confirmed_frame=initial_confirmed_frame,
             smooth_truck_box_xyxy_f=(float(tx1), float(ty1), float(tx2), float(ty2)),
             bed_hits=1 if det.bed_box_xyxy is not None else 0,
         )
+        self._update_track_state(track, frame_idx=frame_idx)
         self.active_tracks[track_id] = track
         return track
 
@@ -256,12 +285,20 @@ class IoUTracker:
         self.recently_lost.append(
             LostTrackSnapshot(
                 track_id=track.track_id,
+                start_frame=track.start_frame,
                 last_truck_box=track.raw_truck_box_xyxy,
                 last_seen_frame=track.last_seen_frame,
+                total_hits=track.total_hits,
+                bed_hits=track.bed_hits,
+                track_state=track.track_state,
+                confirmed_frame=track.confirmed_frame,
+                max_area_seen=track.max_area_seen,
+                last_area=track.last_area,
                 best_candidate=track.best_candidate,
                 vote_candidates=list(track.vote_candidates),
                 last_vote_sample_frame=track.last_vote_sample_frame,
                 phase_results=track.phase_results,
+                best_image_path=track.best_image_path,
             )
         )
 
@@ -380,6 +417,7 @@ class IoUTracker:
             track.last_area = max(0, (tx2 - tx1) * (ty2 - ty1))
             track.max_area_seen = max(track.max_area_seen, track.last_area)
             track.missed_count = 0
+            self._update_track_state(track, frame_idx=frame_idx)
             assigned_tracks.add(best_track_id)
             self._remove_lost_snapshot(best_track_id)
             matches.append((best_track_id, det, False))
@@ -394,6 +432,16 @@ class IoUTracker:
         dst.max_area_seen = max(dst.max_area_seen, src.max_area_seen)
         dst.last_area = max(dst.last_area, src.last_area)
         dst.last_conf = max(dst.last_conf, src.last_conf)
+        if dst.track_state != "confirmed" and src.track_state == "confirmed":
+            dst.track_state = "confirmed"
+        if dst.confirmed_frame is None:
+            dst.confirmed_frame = src.confirmed_frame
+        elif src.confirmed_frame is not None:
+            dst.confirmed_frame = min(dst.confirmed_frame, src.confirmed_frame)
+        if dst.track_state != "confirmed" and dst.total_hits >= self.track_confirm_hits:
+            dst.track_state = "confirmed"
+            if dst.confirmed_frame is None:
+                dst.confirmed_frame = dst.last_seen_frame
 
         if dst.best_candidate is None or (
             src.best_candidate is not None and src.best_candidate.score > dst.best_candidate.score
@@ -510,11 +558,20 @@ class IoUTracker:
             )
             if lost_item is not None and lost_item.track_id not in self.active_tracks:
                 track = self._create_track(det=det, frame_idx=frame_idx, track_id=lost_item.track_id)
+                track.start_frame = int(lost_item.start_frame)
+                track.total_hits = max(1, int(lost_item.total_hits) + 1)
+                track.bed_hits = max(0, int(lost_item.bed_hits) + (1 if det.bed_box_xyxy is not None else 0))
+                track.track_state = str(lost_item.track_state)
+                track.confirmed_frame = lost_item.confirmed_frame
+                track.max_area_seen = max(int(lost_item.max_area_seen), track.max_area_seen)
+                track.last_area = max(int(lost_item.last_area), track.last_area)
                 track.best_candidate = lost_item.best_candidate
                 track.vote_candidates = list(lost_item.vote_candidates)
                 track.last_vote_sample_frame = lost_item.last_vote_sample_frame
                 track.phase_results = lost_item.phase_results
+                track.best_image_path = lost_item.best_image_path
                 track.matched_in_update = True
+                self._update_track_state(track, frame_idx=frame_idx)
                 self._remove_lost_snapshot(lost_item.track_id)
                 self.total_merges += 1
                 gap = frame_idx - lost_item.last_seen_frame
