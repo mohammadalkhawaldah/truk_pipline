@@ -509,7 +509,7 @@ def _format_event_console_line(
 def _event_violation_display(event: dict[str, Any]) -> str:
     violation = bool(event.get("violation", False))
     if not violation:
-        return "Under Investigation"
+        return "under_investigation"
 
     coverage = event.get("coverage")
     shape = event.get("shape")
@@ -522,7 +522,7 @@ def _event_violation_display(event: dict[str, Any]) -> str:
         and (irregular_type is not None)
     )
     if from_phase4_cls:
-        return "Under Investigation"
+        return "under_investigation"
 
     return "True"
 
