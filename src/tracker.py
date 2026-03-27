@@ -113,6 +113,29 @@ def iou_xyxy(a: tuple[int, int, int, int], b: tuple[int, int, int, int]) -> floa
     return float(inter / union)
 
 
+def overlap_over_min_area_xyxy(a: tuple[int, int, int, int], b: tuple[int, int, int, int]) -> float:
+    ax1, ay1, ax2, ay2 = a
+    bx1, by1, bx2, by2 = b
+
+    ix1 = max(ax1, bx1)
+    iy1 = max(ay1, by1)
+    ix2 = min(ax2, bx2)
+    iy2 = min(ay2, by2)
+
+    iw = max(0, ix2 - ix1)
+    ih = max(0, iy2 - iy1)
+    inter = iw * ih
+    if inter <= 0:
+        return 0.0
+
+    area_a = max(0, ax2 - ax1) * max(0, ay2 - ay1)
+    area_b = max(0, bx2 - bx1) * max(0, by2 - by1)
+    denom = min(area_a, area_b)
+    if denom <= 0:
+        return 0.0
+    return float(inter / denom)
+
+
 def center_xyxy(box: tuple[int, int, int, int]) -> tuple[float, float]:
     x1, y1, x2, y2 = box
     return ((x1 + x2) / 2.0, (y1 + y2) / 2.0)
@@ -207,6 +230,16 @@ class IoUTracker:
         merge_center_dist_ratio: float = 0.15,
         active_match_center_dist_ratio: float = 0.08,
         duplicate_iou_threshold: float = 0.85,
+        active_duplicate_iou_threshold: float = 0.45,
+        active_duplicate_bed_iou_threshold: float = 0.25,
+        startup_duplicate_window_frames: int = 12,
+        startup_duplicate_iou_threshold: float = 0.30,
+        startup_duplicate_bed_iou_threshold: float = 0.20,
+        startup_duplicate_center_dist_ratio: float = 0.18,
+        startup_duplicate_overlap_ratio: float = 0.60,
+        exit_duplicate_iou_threshold: float = 0.35,
+        exit_duplicate_bed_iou_threshold: float = 0.25,
+        new_track_ignore_lower_ratio: float = 0.0,
         edge_guard: bool = True,
         edge_margin: int = 80,
         recently_lost_maxlen: int = 256,
@@ -223,6 +256,16 @@ class IoUTracker:
         self.merge_center_dist_ratio = float(max(0.0, merge_center_dist_ratio))
         self.active_match_center_dist_ratio = float(max(0.0, active_match_center_dist_ratio))
         self.duplicate_iou_threshold = float(max(0.0, min(1.0, duplicate_iou_threshold)))
+        self.active_duplicate_iou_threshold = float(max(0.0, min(1.0, active_duplicate_iou_threshold)))
+        self.active_duplicate_bed_iou_threshold = float(max(0.0, min(1.0, active_duplicate_bed_iou_threshold)))
+        self.startup_duplicate_window_frames = int(max(0, startup_duplicate_window_frames))
+        self.startup_duplicate_iou_threshold = float(max(0.0, min(1.0, startup_duplicate_iou_threshold)))
+        self.startup_duplicate_bed_iou_threshold = float(max(0.0, min(1.0, startup_duplicate_bed_iou_threshold)))
+        self.startup_duplicate_center_dist_ratio = float(max(0.0, startup_duplicate_center_dist_ratio))
+        self.startup_duplicate_overlap_ratio = float(max(0.0, min(1.0, startup_duplicate_overlap_ratio)))
+        self.exit_duplicate_iou_threshold = float(max(0.0, min(1.0, exit_duplicate_iou_threshold)))
+        self.exit_duplicate_bed_iou_threshold = float(max(0.0, min(1.0, exit_duplicate_bed_iou_threshold)))
+        self.new_track_ignore_lower_ratio = float(max(0.0, min(0.95, new_track_ignore_lower_ratio)))
         self.edge_guard = bool(edge_guard)
         self.edge_margin = int(max(0, edge_margin))
 
@@ -533,6 +576,141 @@ class IoUTracker:
             self._remove_lost_snapshot(tid)
         return logs
 
+    def _find_exit_duplicate_track(
+        self,
+        det: Detection,
+        frame_idx: int,
+        frame_shape: tuple[int, int],
+    ) -> TrackState | None:
+        frame_h, frame_w = frame_shape
+        if not self._near_edge(det.xyxy, frame_w, frame_h):
+            return None
+
+        best_track = None
+        best_key = (-1.0, -1.0, float("-inf"))
+        for track in self.active_tracks.values():
+            if not track.is_confirmed:
+                continue
+            if track.last_seen_frame != frame_idx:
+                continue
+            truck_iou = iou_xyxy(det.xyxy, track.raw_truck_box_xyxy)
+            bed_iou = 0.0
+            if det.bed_box_xyxy is not None and track.bed_box_xyxy is not None:
+                bed_iou = iou_xyxy(det.bed_box_xyxy, track.bed_box_xyxy)
+            if truck_iou < self.exit_duplicate_iou_threshold and bed_iou < self.exit_duplicate_bed_iou_threshold:
+                continue
+            candidate_key = (truck_iou, bed_iou, float(track.total_hits))
+            if candidate_key > best_key:
+                best_key = candidate_key
+                best_track = track
+        return best_track
+
+    def _find_active_duplicate_track(
+        self,
+        det: Detection,
+        frame_idx: int,
+    ) -> TrackState | None:
+        best_track = None
+        best_key = (-1.0, -1.0, float("-inf"))
+        for track in self.active_tracks.values():
+            if not track.is_confirmed:
+                continue
+            if track.last_seen_frame != frame_idx:
+                continue
+            truck_iou = iou_xyxy(det.xyxy, track.raw_truck_box_xyxy)
+            bed_iou = 0.0
+            if det.bed_box_xyxy is not None and track.bed_box_xyxy is not None:
+                bed_iou = iou_xyxy(det.bed_box_xyxy, track.bed_box_xyxy)
+            if truck_iou < self.active_duplicate_iou_threshold and bed_iou < self.active_duplicate_bed_iou_threshold:
+                continue
+            candidate_key = (truck_iou, bed_iou, float(track.total_hits))
+            if candidate_key > best_key:
+                best_key = candidate_key
+                best_track = track
+        return best_track
+
+    def _find_startup_duplicate_track(
+        self,
+        det: Detection,
+        frame_idx: int,
+        frame_shape: tuple[int, int],
+    ) -> TrackState | None:
+        if frame_idx > self.startup_duplicate_window_frames:
+            return None
+        frame_h, frame_w = frame_shape
+        frame_diag = max(1.0, float((frame_w ** 2 + frame_h ** 2) ** 0.5))
+        max_center_dist = self.startup_duplicate_center_dist_ratio * frame_diag
+        best_track = None
+        best_key = (-1.0, -1.0, float("-inf"), float("-inf"))
+        for track in self.active_tracks.values():
+            if track.last_seen_frame != frame_idx:
+                continue
+            truck_iou = iou_xyxy(det.xyxy, track.raw_truck_box_xyxy)
+            bed_iou = 0.0
+            cdist = center_distance(det.xyxy, track.raw_truck_box_xyxy)
+            if det.bed_box_xyxy is not None and track.bed_box_xyxy is not None:
+                bed_iou = iou_xyxy(det.bed_box_xyxy, track.bed_box_xyxy)
+            overlap_ratio = overlap_over_min_area_xyxy(det.xyxy, track.raw_truck_box_xyxy)
+            if (
+                truck_iou < self.startup_duplicate_iou_threshold
+                and bed_iou < self.startup_duplicate_bed_iou_threshold
+                and overlap_ratio < self.startup_duplicate_overlap_ratio
+                and cdist > max_center_dist
+            ):
+                continue
+            candidate_key = (truck_iou, bed_iou, -cdist, float(track.total_hits))
+            if candidate_key > best_key:
+                best_key = candidate_key
+                best_track = track
+        return best_track
+
+    def _suppress_startup_parallel_tracks(
+        self,
+        frame_idx: int,
+        frame_shape: tuple[int, int],
+    ) -> list[str]:
+        if frame_idx > self.startup_duplicate_window_frames:
+            return []
+        frame_h, frame_w = frame_shape
+        frame_diag = max(1.0, float((frame_w ** 2 + frame_h ** 2) ** 0.5))
+        max_center_dist = self.startup_duplicate_center_dist_ratio * frame_diag
+        active_ids = sorted(
+            tid for tid, t in self.active_tracks.items() if t.last_seen_frame == frame_idx
+        )
+        if len(active_ids) < 2:
+            return []
+
+        logs: list[str] = []
+        remove_ids: set[int] = set()
+        for i, a_id in enumerate(active_ids):
+            if a_id in remove_ids or a_id not in self.active_tracks:
+                continue
+            for b_id in active_ids[i + 1 :]:
+                if b_id in remove_ids or b_id not in self.active_tracks:
+                    continue
+                a = self.active_tracks[a_id]
+                b = self.active_tracks[b_id]
+                iou = iou_xyxy(a.raw_truck_box_xyxy, b.raw_truck_box_xyxy)
+                overlap_ratio = overlap_over_min_area_xyxy(a.raw_truck_box_xyxy, b.raw_truck_box_xyxy)
+                cdist = center_distance(a.raw_truck_box_xyxy, b.raw_truck_box_xyxy)
+                if (
+                    iou < self.startup_duplicate_iou_threshold
+                    and overlap_ratio < self.startup_duplicate_overlap_ratio
+                    and cdist > max_center_dist
+                ):
+                    continue
+                keep, drop = self._pick_keep_drop(a, b)
+                self._merge_track_state(dst=keep, src=drop)
+                remove_ids.add(drop.track_id)
+                logs.append(
+                    f"STARTUP_PARALLEL_SUPPRESS: merged ID={drop.track_id} into ID={keep.track_id} "
+                    f"(iou={iou:.3f}, overlap={overlap_ratio:.3f}, center_dist={cdist:.1f})"
+                )
+        for tid in sorted(remove_ids):
+            self.active_tracks.pop(tid, None)
+            self._remove_lost_snapshot(tid)
+        return logs
+
     def update(
         self,
         detections: list[Detection],
@@ -550,6 +728,53 @@ class IoUTracker:
 
         for det in sorted(detections, key=lambda d: d.conf, reverse=True):
             if det.xyxy in matched_boxes:
+                continue
+            if self.new_track_ignore_lower_ratio > 0.0:
+                cutoff_y = float(frame_h) * (1.0 - self.new_track_ignore_lower_ratio)
+                if det.bed_box_xyxy is not None:
+                    _bx, by = center_xyxy(det.bed_box_xyxy)
+                    if by >= cutoff_y:
+                        merge_logs.append(
+                            f"LOWER_ZONE_SUPPRESS: skipped new track in lower "
+                            f"{self.new_track_ignore_lower_ratio:.2f} zone (bed_center_y={by:.1f}, cutoff={cutoff_y:.1f})"
+                        )
+                        continue
+                else:
+                    _tx, ty = center_xyxy(det.xyxy)
+                    if ty >= cutoff_y:
+                        merge_logs.append(
+                            f"LOWER_ZONE_SUPPRESS: skipped new track in lower "
+                            f"{self.new_track_ignore_lower_ratio:.2f} zone (truck_center_y={ty:.1f}, cutoff={cutoff_y:.1f})"
+                        )
+                        continue
+            startup_dup_track = self._find_startup_duplicate_track(
+                det=det,
+                frame_idx=frame_idx,
+                frame_shape=frame_shape,
+            )
+            if startup_dup_track is not None:
+                merge_logs.append(
+                    f"STARTUP_DUP_SUPPRESS: skipped new track as startup duplicate of ID={startup_dup_track.track_id}"
+                )
+                continue
+            active_dup_track = self._find_active_duplicate_track(
+                det=det,
+                frame_idx=frame_idx,
+            )
+            if active_dup_track is not None:
+                merge_logs.append(
+                    f"ACTIVE_DUP_SUPPRESS: skipped new track as duplicate of active ID={active_dup_track.track_id}"
+                )
+                continue
+            exit_dup_track = self._find_exit_duplicate_track(
+                det=det,
+                frame_idx=frame_idx,
+                frame_shape=frame_shape,
+            )
+            if exit_dup_track is not None:
+                merge_logs.append(
+                    f"EXIT_DUP_SUPPRESS: skipped new track near edge as duplicate of ID={exit_dup_track.track_id}"
+                )
                 continue
             lost_item, m_iou, m_dist = self._try_merge_with_recently_lost(
                 det=det,
@@ -587,6 +812,7 @@ class IoUTracker:
             matches.append((new_track.track_id, det, True))
 
         merge_logs.extend(self._suppress_duplicate_tracks(frame_idx=frame_idx, frame_shape=frame_shape))
+        merge_logs.extend(self._suppress_startup_parallel_tracks(frame_idx=frame_idx, frame_shape=frame_shape))
 
         for track in self.active_tracks.values():
             if track.matched_in_update:

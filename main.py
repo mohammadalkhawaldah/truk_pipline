@@ -365,6 +365,15 @@ def parse_args() -> argparse.Namespace:
         help="Center-distance threshold ratio (of frame diagonal) for event deduplication.",
     )
     parser.add_argument(
+        "--new-track-ignore-lower-ratio",
+        type=float,
+        default=config.STREAM_NEW_TRACK_IGNORE_LOWER_RATIO,
+        help=(
+            "Ignore creation of NEW tracks when bed center (or truck center if no bed) "
+            "is in the lower X ratio of image height. Example: 0.30 ignores bottom 30%."
+        ),
+    )
+    parser.add_argument(
         "--non-interactive-model-select",
         action="store_true",
         help="Disable interactive prompt if multiple models are found; highest-scored candidate is used.",
@@ -430,6 +439,7 @@ def main() -> int:
             event_dedup_window_frames=args.event_dedup_window,
             event_dedup_iou_threshold=args.event_dedup_iou,
             event_dedup_center_dist_ratio=args.event_dedup_center_ratio,
+            new_track_ignore_lower_ratio=args.new_track_ignore_lower_ratio,
         )
     else:
         if args.phase == "phase1":

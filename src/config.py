@@ -8,6 +8,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 WEIGHTS_DIR = PROJECT_ROOT / "weights"
 OUTPUT_DIR = PROJECT_ROOT / "outputs"
 INPUT_IMAGES_DIR = PROJECT_ROOT / "data" / "images"
+MARCH25_WEIGHTS_DIR = WEIGHTS_DIR / "weights_March_25"
 
 # Phase 1 defaults
 TOP1_ONLY = True
@@ -95,10 +96,20 @@ STREAM_TRACK_MAX_STEP_PX = 12.0
 STREAM_MAX_DETECT_FPS = 0.0
 STREAM_ACTIVE_MATCH_CENTER_RATIO = 0.08
 STREAM_DUPLICATE_IOU_THRESHOLD = 0.85
+STREAM_ACTIVE_DUPLICATE_IOU_THRESHOLD = 0.45
+STREAM_ACTIVE_DUPLICATE_BED_IOU_THRESHOLD = 0.25
+STREAM_STARTUP_DUPLICATE_WINDOW_FRAMES = 12
+STREAM_STARTUP_DUPLICATE_IOU_THRESHOLD = 0.30
+STREAM_STARTUP_DUPLICATE_BED_IOU_THRESHOLD = 0.20
+STREAM_STARTUP_DUPLICATE_CENTER_RATIO = 0.18
+STREAM_STARTUP_DUPLICATE_OVERLAP_RATIO = 0.60
+STREAM_EXIT_DUPLICATE_IOU_THRESHOLD = 0.35
+STREAM_EXIT_DUPLICATE_BED_IOU_THRESHOLD = 0.25
 STREAM_EVENT_DEDUP_ENABLE = True
 STREAM_EVENT_DEDUP_WINDOW_FRAMES = 45
 STREAM_EVENT_DEDUP_IOU_THRESHOLD = 0.55
 STREAM_EVENT_DEDUP_CENTER_DIST_RATIO = 0.05
+STREAM_NEW_TRACK_IGNORE_LOWER_RATIO = 0.0
 
 # Class mapping for coverage decision.
 PHASE2_COVERED_CLASS_NAMES = [
@@ -153,6 +164,10 @@ HEURISTIC_Y_END_RATIO = 0.85
 def _score_detect_candidate(path: Path) -> int:
     lower = str(path).lower()
     score = 0
+    if "weights_march_25" in lower:
+        score += 40
+    if "best_truck_box_extraction_march_25" in lower:
+        score += 40
     if "bed_detection" in lower:
         score += 12
     if "bed" in lower:
@@ -187,6 +202,10 @@ def _auto_discover_detect_model_path() -> Path | None:
 def _score_cls1_candidate(path: Path) -> int:
     lower = str(path).lower()
     score = 0
+    if "weights_march_25" in lower:
+        score += 40
+    if "best_1st_cls_march_25" in lower:
+        score += 40
     if "classification#1_new1" in lower:
         score += 24
     if "covered_uncovered_cls_best" in lower:
@@ -311,6 +330,12 @@ def _auto_discover_cls3_model_path() -> Path | None:
 def _score_seg_candidate(path: Path) -> int:
     lower = str(path).lower()
     score = 0
+    if "weights_march_25" in lower:
+        score += 40
+    if "best_yolo11_seg_march_26v2" in lower:
+        score += 50
+    if "best_segmentation_march_25" in lower:
+        score += 40
     if "segmentation" in lower or "seg" in lower:
         score += 12
     if "yolo_segmentation" in lower:

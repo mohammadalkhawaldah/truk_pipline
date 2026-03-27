@@ -257,6 +257,8 @@ def _draw_active_tracks_overlay(
     frame_h: int,
     min_bed_persist_frames: int,
 ) -> None:
+    truck_box_thickness = 4
+    bed_box_thickness = 4
     for track_id in sorted(tracker.active_tracks.keys()):
         track = tracker.active_tracks[track_id]
         x1, y1, x2, y2 = clamp_xyxy(*track.truck_box_xyxy, frame_w, frame_h)
@@ -264,13 +266,13 @@ def _draw_active_tracks_overlay(
             continue
 
         # Truck anchor (blue-ish)
-        cv2.rectangle(display_frame, (x1, y1), (x2, y2), (255, 100, 0), 2)
+        cv2.rectangle(display_frame, (x1, y1), (x2, y2), (255, 100, 0), truck_box_thickness)
 
         # Bed child (green) if available
         if track.bed_box_xyxy is not None:
             bx1, by1, bx2, by2 = clamp_xyxy(*track.bed_box_xyxy, frame_w, frame_h)
             if bx2 > bx1 and by2 > by1:
-                cv2.rectangle(display_frame, (bx1, by1), (bx2, by2), (0, 220, 0), 2)
+                cv2.rectangle(display_frame, (bx1, by1), (bx2, by2), (0, 220, 0), bed_box_thickness)
 
         warming = track.bed_hits < min_bed_persist_frames
         tentative = not track.is_confirmed
@@ -1019,6 +1021,16 @@ def run_stream_event(
     track_max_step_px: float = config.STREAM_TRACK_MAX_STEP_PX,
     active_match_center_dist_ratio: float = config.STREAM_ACTIVE_MATCH_CENTER_RATIO,
     duplicate_iou_threshold: float = config.STREAM_DUPLICATE_IOU_THRESHOLD,
+    active_duplicate_iou_threshold: float = config.STREAM_ACTIVE_DUPLICATE_IOU_THRESHOLD,
+    active_duplicate_bed_iou_threshold: float = config.STREAM_ACTIVE_DUPLICATE_BED_IOU_THRESHOLD,
+    startup_duplicate_window_frames: int = config.STREAM_STARTUP_DUPLICATE_WINDOW_FRAMES,
+    startup_duplicate_iou_threshold: float = config.STREAM_STARTUP_DUPLICATE_IOU_THRESHOLD,
+    startup_duplicate_bed_iou_threshold: float = config.STREAM_STARTUP_DUPLICATE_BED_IOU_THRESHOLD,
+    startup_duplicate_center_dist_ratio: float = config.STREAM_STARTUP_DUPLICATE_CENTER_RATIO,
+    startup_duplicate_overlap_ratio: float = config.STREAM_STARTUP_DUPLICATE_OVERLAP_RATIO,
+    exit_duplicate_iou_threshold: float = config.STREAM_EXIT_DUPLICATE_IOU_THRESHOLD,
+    exit_duplicate_bed_iou_threshold: float = config.STREAM_EXIT_DUPLICATE_BED_IOU_THRESHOLD,
+    new_track_ignore_lower_ratio: float = config.STREAM_NEW_TRACK_IGNORE_LOWER_RATIO,
     event_dedup_enable: bool = config.STREAM_EVENT_DEDUP_ENABLE,
     event_dedup_window_frames: int = config.STREAM_EVENT_DEDUP_WINDOW_FRAMES,
     event_dedup_iou_threshold: float = config.STREAM_EVENT_DEDUP_IOU_THRESHOLD,
@@ -1064,6 +1076,16 @@ def run_stream_event(
     track_max_step_px = float(max(0.0, track_max_step_px))
     active_match_center_dist_ratio = float(max(0.0, active_match_center_dist_ratio))
     duplicate_iou_threshold = float(max(0.0, min(1.0, duplicate_iou_threshold)))
+    active_duplicate_iou_threshold = float(max(0.0, min(1.0, active_duplicate_iou_threshold)))
+    active_duplicate_bed_iou_threshold = float(max(0.0, min(1.0, active_duplicate_bed_iou_threshold)))
+    startup_duplicate_window_frames = max(0, int(startup_duplicate_window_frames))
+    startup_duplicate_iou_threshold = float(max(0.0, min(1.0, startup_duplicate_iou_threshold)))
+    startup_duplicate_bed_iou_threshold = float(max(0.0, min(1.0, startup_duplicate_bed_iou_threshold)))
+    startup_duplicate_center_dist_ratio = float(max(0.0, startup_duplicate_center_dist_ratio))
+    startup_duplicate_overlap_ratio = float(max(0.0, min(1.0, startup_duplicate_overlap_ratio)))
+    exit_duplicate_iou_threshold = float(max(0.0, min(1.0, exit_duplicate_iou_threshold)))
+    exit_duplicate_bed_iou_threshold = float(max(0.0, min(1.0, exit_duplicate_bed_iou_threshold)))
+    new_track_ignore_lower_ratio = float(max(0.0, min(0.95, new_track_ignore_lower_ratio)))
     event_dedup_enable = bool(event_dedup_enable)
     event_dedup_window_frames = max(1, int(event_dedup_window_frames))
     event_dedup_iou_threshold = float(max(0.0, min(1.0, event_dedup_iou_threshold)))
@@ -1141,6 +1163,16 @@ def run_stream_event(
         merge_center_dist_ratio=merge_center_dist_ratio,
         active_match_center_dist_ratio=active_match_center_dist_ratio,
         duplicate_iou_threshold=duplicate_iou_threshold,
+        active_duplicate_iou_threshold=active_duplicate_iou_threshold,
+        active_duplicate_bed_iou_threshold=active_duplicate_bed_iou_threshold,
+        startup_duplicate_window_frames=startup_duplicate_window_frames,
+        startup_duplicate_iou_threshold=startup_duplicate_iou_threshold,
+        startup_duplicate_bed_iou_threshold=startup_duplicate_bed_iou_threshold,
+        startup_duplicate_center_dist_ratio=startup_duplicate_center_dist_ratio,
+        startup_duplicate_overlap_ratio=startup_duplicate_overlap_ratio,
+        exit_duplicate_iou_threshold=exit_duplicate_iou_threshold,
+        exit_duplicate_bed_iou_threshold=exit_duplicate_bed_iou_threshold,
+        new_track_ignore_lower_ratio=new_track_ignore_lower_ratio,
         edge_guard=edge_guard,
         edge_margin=edge_margin,
     )
@@ -1150,7 +1182,8 @@ def run_stream_event(
         "merge_window=%s merge_iou=%.3f merge_center_ratio=%.3f edge_guard=%s edge_margin=%s | "
         "infer_mode=%s | top2=%s | vote=%s vote_every=%s vote_max_samples=%s | "
         "confirm_hits=%s | dedup=%s dedup_window=%s dedup_iou=%.2f dedup_center_ratio=%.3f | "
-        "smooth_alpha=%.2f deadband=%.1f max_step=%.1f active_center_ratio=%.3f dup_iou=%.2f max_detect_fps=%.2f",
+        "smooth_alpha=%.2f deadband=%.1f max_step=%.1f active_center_ratio=%.3f "
+        "dup_iou=%.2f max_detect_fps=%.2f ignore_new_lower=%.2f",
         video,
         every_n,
         missed_M,
@@ -1176,6 +1209,7 @@ def run_stream_event(
         active_match_center_dist_ratio,
         duplicate_iou_threshold,
         max_detect_fps,
+        new_track_ignore_lower_ratio,
     )
 
     frame_idx = -1
@@ -1304,8 +1338,8 @@ def run_stream_event(
                 if best_updated:
                     debug_frame = frame.copy()
                     tx1, ty1, tx2, ty2 = clamp_xyxy(*track.truck_box_xyxy, frame_w, frame_h)
-                    cv2.rectangle(debug_frame, (tx1, ty1), (tx2, ty2), (255, 100, 0), 2)
-                    cv2.rectangle(debug_frame, (bx1, by1), (bx2, by2), (0, 220, 0), 2)
+                    cv2.rectangle(debug_frame, (tx1, ty1), (tx2, ty2), (255, 100, 0), 4)
+                    cv2.rectangle(debug_frame, (bx1, by1), (bx2, by2), (0, 220, 0), 4)
                     cv2.putText(
                         debug_frame,
                         f"track={track.track_id} score={score:.3f}",
