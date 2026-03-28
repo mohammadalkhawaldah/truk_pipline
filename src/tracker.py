@@ -243,6 +243,7 @@ class IoUTracker:
         edge_guard: bool = True,
         edge_margin: int = 80,
         recently_lost_maxlen: int = 256,
+        debug_tracking: bool = False,
     ) -> None:
         self.iou_threshold = float(iou_threshold)
         self.missed_M = int(missed_M)
@@ -268,6 +269,7 @@ class IoUTracker:
         self.new_track_ignore_lower_ratio = float(max(0.0, min(0.95, new_track_ignore_lower_ratio)))
         self.edge_guard = bool(edge_guard)
         self.edge_margin = int(max(0, edge_margin))
+        self.debug_tracking = bool(debug_tracking)
 
         self.active_tracks: dict[int, TrackState] = {}
         self.recently_lost: deque[LostTrackSnapshot] = deque(maxlen=max(8, int(recently_lost_maxlen)))
@@ -390,12 +392,115 @@ class IoUTracker:
                     best_dist = dist
         return best_item, best_iou, best_dist
 
+    def _apply_detection_to_track(self, track: TrackState, det: Detection, frame_idx: int) -> None:
+        track.last_seen_frame = frame_idx
+        track.raw_truck_box_xyxy = det.xyxy
+        if track.smooth_truck_box_xyxy_f is None:
+            track.smooth_truck_box_xyxy_f = (
+                float(det.xyxy[0]),
+                float(det.xyxy[1]),
+                float(det.xyxy[2]),
+                float(det.xyxy[3]),
+            )
+        else:
+            track.smooth_truck_box_xyxy_f = _smooth_box(
+                prev=track.smooth_truck_box_xyxy_f,
+                new_box=det.xyxy,
+                alpha=self.smooth_alpha,
+                deadband_px=self.smooth_deadband_px,
+                max_step_px=self.smooth_max_step_px,
+            )
+        track.truck_box_xyxy = _round_box(track.smooth_truck_box_xyxy_f)
+        track.bed_box_xyxy = det.bed_box_xyxy
+        track.bed_conf = float(det.bed_conf)
+        track.last_conf = float(det.conf)
+        track.matched_in_update = True
+        track.total_hits += 1
+        if det.bed_box_xyxy is not None:
+            track.bed_hits += 1
+        tx1, ty1, tx2, ty2 = track.truck_box_xyxy
+        track.last_area = max(0, (tx2 - tx1) * (ty2 - ty1))
+        track.max_area_seen = max(track.max_area_seen, track.last_area)
+        track.missed_count = 0
+        self._update_track_state(track, frame_idx=frame_idx)
+        self._remove_lost_snapshot(track.track_id)
+
+    def _try_recover_stale_active_track(
+        self,
+        det: Detection,
+        frame_idx: int,
+        frame_shape: tuple[int, int],
+        assigned_tracks: set[int],
+    ) -> tuple[TrackState | None, float, float]:
+        frame_h, frame_w = frame_shape
+        frame_diag = max(1.0, float((frame_w ** 2 + frame_h ** 2) ** 0.5))
+        max_center_dist = self.merge_center_dist_ratio * frame_diag
+        fallback_center_dist = max(max_center_dist, 0.35 * frame_diag)
+
+        best_track = None
+        best_iou = -1.0
+        best_dist = float("inf")
+        best_key = (False, False, -1.0, float("-inf"), float("-inf"))
+        stale_candidates: list[tuple[TrackState, float, float]] = []
+
+        for track_id, track in self.active_tracks.items():
+            if track_id in assigned_tracks:
+                continue
+            if track.last_seen_frame >= frame_idx:
+                continue
+
+            iou = iou_xyxy(det.xyxy, track.raw_truck_box_xyxy)
+            dist = center_distance(det.xyxy, track.raw_truck_box_xyxy)
+            stale_candidates.append((track, iou, dist))
+            bed_iou = 0.0
+            if det.bed_box_xyxy is not None and track.bed_box_xyxy is not None:
+                bed_iou = iou_xyxy(det.bed_box_xyxy, track.bed_box_xyxy)
+
+            matched_by_iou = iou >= self.merge_iou_threshold
+            matched_by_center = dist <= max_center_dist
+            matched_by_bed = bed_iou >= self.active_duplicate_bed_iou_threshold
+            if not matched_by_iou and not matched_by_center and not matched_by_bed:
+                continue
+
+            candidate_key = (
+                track.is_confirmed,
+                matched_by_iou,
+                bed_iou,
+                -dist,
+                float(track.total_hits),
+            )
+            if candidate_key > best_key:
+                best_key = candidate_key
+                best_track = track
+                best_iou = iou
+                best_dist = dist
+
+        if best_track is not None:
+            return best_track, best_iou, best_dist
+
+        current_frame_confirmed_tracks = [
+            track
+            for track in self.active_tracks.values()
+            if track.is_confirmed and track.last_seen_frame == frame_idx
+        ]
+        confirmed_stale = [
+            (track, iou, dist)
+            for track, iou, dist in stale_candidates
+            if track.is_confirmed and (frame_idx - track.last_seen_frame) <= self.merge_window_frames
+        ]
+        if len(current_frame_confirmed_tracks) == 0 and len(confirmed_stale) == 1:
+            track, iou, dist = confirmed_stale[0]
+            if dist <= fallback_center_dist:
+                return track, iou, dist
+
+        return best_track, best_iou, best_dist
+
     def _match_detections_to_tracks(
         self,
         detections: list[Detection],
         frame_idx: int,
         frame_shape: tuple[int, int],
-    ) -> list[tuple[int, Detection, bool]]:
+    ) -> tuple[list[tuple[int, Detection, bool]], list[str]]:
         frame_h, frame_w = frame_shape
         frame_diag = max(1.0, float((frame_w ** 2 + frame_h ** 2) ** 0.5))
         max_center_dist = self.active_match_center_dist_ratio * frame_diag
@@ -403,11 +508,13 @@ class IoUTracker:
             track.matched_in_update = False
 
         matches: list[tuple[int, Detection, bool]] = []
+        debug_logs: list[str] = []
         assigned_tracks: set[int] = set()
 
         for det in sorted(detections, key=lambda d: d.conf, reverse=True):
             best_track_id = None
             best_key = (False, -1.0, float("-inf"), float("-inf"))
+            det_logs: list[str] = []
             for track_id, track in self.active_tracks.items():
                 if track_id in assigned_tracks:
                     continue
@@ -415,6 +522,13 @@ class IoUTracker:
                 dist = center_distance(det.xyxy, track.raw_truck_box_xyxy)
                 matched_by_iou = iou >= self.iou_threshold
                 matched_by_center = dist <= max_center_dist
+                if self.debug_tracking:
+                    det_logs.append(
+                        f"TRACK_DEBUG frame={frame_idx} det={det.xyxy} cand_id={track_id} "
+                        f"track_box={track.raw_truck_box_xyxy} iou={iou:.3f} dist={dist:.1f} "
+                        f"match_iou={int(matched_by_iou)} match_center={int(matched_by_center)} "
+                        f"stale={int(track.last_seen_frame < frame_idx)} hits={track.total_hits} bed_hits={track.bed_hits}"
+                    )
                 if not matched_by_iou and not matched_by_center:
                     continue
                 candidate_key = (
@@ -428,43 +542,24 @@ class IoUTracker:
                     best_track_id = track_id
 
             if best_track_id is None:
+                if self.debug_tracking:
+                    debug_logs.extend(det_logs)
+                    debug_logs.append(
+                        f"TRACK_DEBUG frame={frame_idx} det={det.xyxy} no_active_match "
+                        f"threshold_iou={self.iou_threshold:.3f} threshold_center={max_center_dist:.1f}"
+                    )
                 continue
 
             track = self.active_tracks[best_track_id]
-            track.last_seen_frame = frame_idx
-            track.raw_truck_box_xyxy = det.xyxy
-            if track.smooth_truck_box_xyxy_f is None:
-                track.smooth_truck_box_xyxy_f = (
-                    float(det.xyxy[0]),
-                    float(det.xyxy[1]),
-                    float(det.xyxy[2]),
-                    float(det.xyxy[3]),
-                )
-            else:
-                track.smooth_truck_box_xyxy_f = _smooth_box(
-                    prev=track.smooth_truck_box_xyxy_f,
-                    new_box=det.xyxy,
-                    alpha=self.smooth_alpha,
-                    deadband_px=self.smooth_deadband_px,
-                    max_step_px=self.smooth_max_step_px,
-                )
-            track.truck_box_xyxy = _round_box(track.smooth_truck_box_xyxy_f)
-            track.bed_box_xyxy = det.bed_box_xyxy
-            track.bed_conf = float(det.bed_conf)
-            track.last_conf = float(det.conf)
-            track.matched_in_update = True
-            track.total_hits += 1
-            if det.bed_box_xyxy is not None:
-                track.bed_hits += 1
-            tx1, ty1, tx2, ty2 = track.truck_box_xyxy
-            track.last_area = max(0, (tx2 - tx1) * (ty2 - ty1))
-            track.max_area_seen = max(track.max_area_seen, track.last_area)
-            track.missed_count = 0
-            self._update_track_state(track, frame_idx=frame_idx)
+            self._apply_detection_to_track(track=track, det=det, frame_idx=frame_idx)
             assigned_tracks.add(best_track_id)
-            self._remove_lost_snapshot(best_track_id)
             matches.append((best_track_id, det, False))
-        return matches
+            if self.debug_tracking:
+                debug_logs.extend(det_logs)
+                debug_logs.append(
+                    f"TRACK_DEBUG frame={frame_idx} det={det.xyxy} matched_active_id={best_track_id}"
+                )
+        return matches, debug_logs
 
     def _merge_track_state(self, dst: TrackState, src: TrackState) -> None:
         dst.start_frame = min(dst.start_frame, src.start_frame)
@@ -719,15 +814,44 @@ class IoUTracker:
     ) -> tuple[dict[int, TrackState], list[TrackState], list[str]]:
         frame_h, frame_w = frame_shape
         merge_logs: list[str] = []
-        matches = self._match_detections_to_tracks(
+        matches, match_debug_logs = self._match_detections_to_tracks(
             detections=detections,
             frame_idx=frame_idx,
             frame_shape=frame_shape,
         )
+        merge_logs.extend(match_debug_logs)
         matched_boxes = {det.xyxy for _, det, _ in matches}
 
         for det in sorted(detections, key=lambda d: d.conf, reverse=True):
             if det.xyxy in matched_boxes:
+                continue
+            recovered_track, recover_iou, recover_dist = self._try_recover_stale_active_track(
+                det=det,
+                frame_idx=frame_idx,
+                frame_shape=frame_shape,
+                assigned_tracks={track_id for track_id, *_rest in matches},
+            )
+            if recovered_track is not None:
+                self._apply_detection_to_track(track=recovered_track, det=det, frame_idx=frame_idx)
+                matches.append((recovered_track.track_id, det, True))
+                merge_logs.append(
+                    f"STALE_ACTIVE_RECOVER: reattached detection to ID={recovered_track.track_id} "
+                    f"(iou={recover_iou:.3f}, center_dist={recover_dist:.1f})"
+                )
+                continue
+            elif self.debug_tracking:
+                merge_logs.append(
+                    f"TRACK_DEBUG frame={frame_idx} det={det.xyxy} stale_recover_failed"
+                )
+            confirmed_active_exists = any(
+                track.is_confirmed and track.last_seen_frame >= (frame_idx - 1)
+                for track in self.active_tracks.values()
+            )
+            if confirmed_active_exists and not self._near_edge(det.xyxy, frame_w, frame_h):
+                merge_logs.append(
+                    f"MIDSCENE_NEW_SUPPRESS: skipped new track away from edges while confirmed track exists "
+                    f"(det={det.xyxy})"
+                )
                 continue
             if self.new_track_ignore_lower_ratio > 0.0:
                 cutoff_y = float(frame_h) * (1.0 - self.new_track_ignore_lower_ratio)
@@ -810,6 +934,10 @@ class IoUTracker:
             new_track = self._create_track(det=det, frame_idx=frame_idx, track_id=None)
             new_track.matched_in_update = True
             matches.append((new_track.track_id, det, True))
+            if self.debug_tracking:
+                merge_logs.append(
+                    f"TRACK_DEBUG frame={frame_idx} det={det.xyxy} created_new_id={new_track.track_id}"
+                )
 
         merge_logs.extend(self._suppress_duplicate_tracks(frame_idx=frame_idx, frame_shape=frame_shape))
         merge_logs.extend(self._suppress_startup_parallel_tracks(frame_idx=frame_idx, frame_shape=frame_shape))

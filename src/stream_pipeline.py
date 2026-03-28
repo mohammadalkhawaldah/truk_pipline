@@ -1035,6 +1035,7 @@ def run_stream_event(
     event_dedup_window_frames: int = config.STREAM_EVENT_DEDUP_WINDOW_FRAMES,
     event_dedup_iou_threshold: float = config.STREAM_EVENT_DEDUP_IOU_THRESHOLD,
     event_dedup_center_dist_ratio: float = config.STREAM_EVENT_DEDUP_CENTER_DIST_RATIO,
+    debug_tracking: bool = False,
     max_frames: int | None = None,
 ) -> bool:
     ensure_dirs([config.OUTPUT_DIR, config.STREAM_EVENTS_IMAGES_DIR, config.PROJECT_ROOT / "logs"])
@@ -1175,6 +1176,7 @@ def run_stream_event(
         new_track_ignore_lower_ratio=new_track_ignore_lower_ratio,
         edge_guard=edge_guard,
         edge_margin=edge_margin,
+        debug_tracking=debug_tracking,
     )
 
     logger.info(

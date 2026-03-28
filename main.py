@@ -309,6 +309,13 @@ def parse_args() -> argparse.Namespace:
         help="In stream_event mode: print only event summary lines and final stats to console.",
     )
     parser.add_argument(
+        "--debug-tracking",
+        type=int,
+        choices=[0, 1],
+        default=0,
+        help="Emit detailed per-frame tracking diagnostics to the log for stream_event runs.",
+    )
+    parser.add_argument(
         "--min-event-hits",
         type=int,
         default=config.STREAM_MIN_EVENT_HITS,
@@ -426,6 +433,7 @@ def main() -> int:
             preview_scale=args.preview_scale,
             preview_fullscreen=bool(args.preview_fullscreen),
             summary_only=bool(args.summary_only),
+            debug_tracking=bool(args.debug_tracking),
             min_event_hits=args.min_event_hits,
             min_bed_persist_frames=args.min_bed_persist_frames,
             vote_enable=bool(args.vote_enable),
