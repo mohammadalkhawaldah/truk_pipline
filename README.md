@@ -299,4 +299,5 @@ git status --short
 ## 12) Notes for Collaborators
 
 See `COLLEAGUE_RUN.md` for a compact quick-start.
+See `README_INTEGRATED.md` for the dedicated GitHub clone + integrated-run guide.
 
