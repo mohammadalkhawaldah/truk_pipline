@@ -75,25 +75,51 @@ You can also override by environment variables:
 
 ## 4) Environment Setup
 
+### Integrated Clone (Recommended)
+
+This repository can now run the `truck_size_2` fill estimator and the `truk_pipline` compliance pipeline together.
+
+Clone with submodules so both codebases are pulled together:
+
+```powershell
+git clone --recurse-submodules https://github.com/mohammadalkhawaldah/truk_pipline.git
+cd truk_pipline
+```
+
+If you already cloned without submodules:
+
+```powershell
+git submodule update --init --recursive
+```
+
 ### Windows (PowerShell)
 
 ```powershell
 cd C:\Users\moham\OneDrive\Documents\truck_pipline
-py -3.11 -m venv pipeline_venv
-.\pipeline_venv\Scripts\Activate.ps1
-python -m pip install --upgrade pip
-pip install -r requirements.txt
+.\setup_integrated_env.ps1
 ```
 
 ### macOS/Linux (bash)
 
 ```bash
 cd /path/to/truck_pipline
-python3.11 -m venv pipeline_venv
-source pipeline_venv/bin/activate
-python -m pip install --upgrade pip
-pip install -r requirements.txt
+python3 -m venv .venv_truk_pipline
+python3 -m venv .venv_truck_size_2
+source .venv_truk_pipline/bin/activate
+python -m pip install --upgrade pip setuptools wheel
+python -m pip install -r requirements.txt
+deactivate
+source .venv_truck_size_2/bin/activate
+python -m pip install --upgrade pip setuptools wheel
+python -m pip install -r truck_size_2/requirements.txt
+python -m pip install ultralytics==8.4.30 torch==2.11.0 torchvision==0.26.0 numpy==2.2.6 opencv-python==4.13.0.92
 ```
+
+The integrated setup uses two repo-local virtual environments:
+- `.venv_truk_pipline` for this repo
+- `.venv_truck_size_2` for the `truck_size_2` submodule
+
+This is intentional because the two codebases require different model/runtime versions.
 
 ## 5) Main Run Modes
 
@@ -185,6 +211,39 @@ Main outputs:
 
 Logs:
 - `logs/stream_event.log`
+- `combined_logs/*.log` from integrated runs
+
+## 8.1 Integrated Run Output
+
+The integrated runner combines:
+- `truck_size_2` fill level output
+- `truk_pipline` event output
+
+It prints only merged final lines like:
+
+```text
+2026-03-28 11:49:23 | TRUCK_ID=1 | COVER_STATUS=uncovered_or_partial | MATERIAL=sand | VIOLATION=True | FILL_LEVEL=96.21%
+```
+
+Run one video:
+
+```powershell
+.\run_integrated_pipeline.ps1 -VideoPath "E:\path\to\video.mp4"
+```
+
+Run all `.mp4` videos in a folder:
+
+```powershell
+Get-ChildItem "E:\path\to\videos" -File -Filter *.mp4 |
+ForEach-Object {
+  .\run_integrated_pipeline.ps1 -VideoPath $_.FullName
+}
+```
+
+Integrated runner behavior:
+- shows preview only from `truck_size_2`
+- runs `truk_pipline` in parallel without preview
+- writes only merged final event lines to `combined_logs/`
 
 ## 9) Event Line Meaning (Console)
 

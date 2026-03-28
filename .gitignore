@@ -5,10 +5,14 @@ __pycache__/
 
 # Virtual environment
 pipeline_venv/
+.venv/
+.venv_truk_pipline/
+.venv_truck_size_2/
 
 # Local artifacts
 outputs/
 logs/
+combined_logs/
 data/
 test_images/
 
