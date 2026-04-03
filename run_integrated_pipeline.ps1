@@ -2,7 +2,7 @@ param(
     [Parameter(Mandatory = $true)]
     [string]$VideoPath,
 
-    [int]$TruckSizeFps = 3,
+    [int]$TruckSizeFps = 2,
 
     [string]$LogDir = ""
 )
@@ -35,6 +35,7 @@ New-Item -ItemType Directory -Force -Path $LogDir | Out-Null
 $videoName = [System.IO.Path]::GetFileNameWithoutExtension($VideoPath)
 $timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
 $logPath = Join-Path $LogDir ("combined_{0}_{1}.log" -f $videoName, $timestamp)
+$repo1OutputDir = Join-Path $truckSizeRepo ("auto_outputs\{0}" -f $videoName)
 $repo1SummaryPath = Join-Path $truckSizeRepo ("auto_outputs\{0}\truck_fill_summary.csv" -f $videoName)
 $repo2EventsPath = Join-Path $repoRoot "outputs\events.jsonl"
 
@@ -74,6 +75,39 @@ function Get-Material {
     return $label
 }
 
+function Clear-DirectoryFiles {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$DirectoryPath
+    )
+
+    if (-not (Test-Path $DirectoryPath)) {
+        return
+    }
+
+    Get-ChildItem -LiteralPath $DirectoryPath -File | Remove-Item -Force
+}
+
+function Remove-DirectoryFiles {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$DirectoryPath
+    )
+
+    if (-not (Test-Path $DirectoryPath)) {
+        return
+    }
+
+    Get-ChildItem -LiteralPath $DirectoryPath -File | Remove-Item -Force
+}
+
+if (Test-Path $repo1OutputDir) {
+    Clear-DirectoryFiles -DirectoryPath $repo1OutputDir
+}
+else {
+    New-Item -ItemType Directory -Force -Path $repo1OutputDir | Out-Null
+}
+
 $repo2StartCount = 0
 if (Test-Path $repo2EventsPath) {
     $repo2StartCount = (Get-Content $repo2EventsPath | Measure-Object -Line).Lines
@@ -88,7 +122,7 @@ $repo2Args = @(
     '--event_infer_mode', 'finalize',
     '--vote-enable', '1',
     '--vote-every', '5',
-    '--vote-max-samples', '10',
+    '--vote-max-samples', '5',
     '--missed_M', '16',
     '--iou_threshold', '0.25',
     '--merge_window', '24',
@@ -197,3 +231,5 @@ if ($combinedLines.Count -eq 0) {
 
 $combinedLines | Set-Content -Path $logPath -Encoding utf8
 $combinedLines | ForEach-Object { $_ }
+
+Remove-DirectoryFiles -DirectoryPath $repo1OutputDir
