@@ -14,6 +14,7 @@ import cv2
 from ultralytics import YOLO
 
 from src import config
+from src.size_event_pipeline import OnlineSizeEventPipeline, SizeEvent
 from src.tracker import CropCandidate, Detection, IoUTracker, TrackState, expand_box_xyxy, iou_xyxy
 from src.utils import clamp_xyxy, ensure_dirs, setup_logger
 
@@ -120,6 +121,18 @@ def _bbox_center_xy(box_xyxy: tuple[int, int, int, int]) -> tuple[float, float]:
     return ((x1 + x2) / 2.0, (y1 + y2) / 2.0)
 
 
+def _clamp_xyxy_floor(x1: float, y1: float, x2: float, y2: float, width: int, height: int) -> tuple[int, int, int, int]:
+    x1_i = max(0, min(int(x1), max(0, width - 1)))
+    y1_i = max(0, min(int(y1), max(0, height - 1)))
+    x2_i = max(0, min(int(x2), width))
+    y2_i = max(0, min(int(y2), height))
+    if x2_i <= x1_i:
+        x2_i = min(width, x1_i + 1)
+    if y2_i <= y1_i:
+        y2_i = min(height, y1_i + 1)
+    return (x1_i, y1_i, x2_i, y2_i)
+
+
 def _point_in_box(px: float, py: float, box_xyxy: tuple[int, int, int, int]) -> bool:
     x1, y1, x2, y2 = box_xyxy
     return (px >= x1) and (px <= x2) and (py >= y1) and (py <= y2)
@@ -159,9 +172,10 @@ def _extract_anchor_detections(
         cls_name = names.get(cls_id, f"class_{cls_id}")
 
         if truck_ids and cls_id in truck_ids:
+            truck_box_xyxy = _clamp_xyxy_floor(x1, y1, x2, y2, w, h)
             truck_dets.append(
                 Detection(
-                    xyxy=box_xyxy,
+                    xyxy=truck_box_xyxy,
                     conf=conf,
                     cls_id=cls_id,
                     cls_name=cls_name,
@@ -169,9 +183,10 @@ def _extract_anchor_detections(
                 )
             )
         if bed_ids and cls_id in bed_ids:
+            bed_box_xyxy = _clamp_xyxy_floor(x1, y1, x2, y2, w, h)
             bed_dets.append(
                 Detection(
-                    xyxy=box_xyxy,
+                    xyxy=bed_box_xyxy,
                     conf=conf,
                     cls_id=cls_id,
                     cls_name=cls_name,
@@ -500,12 +515,17 @@ def _format_event_console_line(
     event_id: int,
     cover_status: str,
     material: str,
+    fill_display: str,
     violation_display: str,
+    fill_best_frame: int | None = None,
 ) -> str:
-    return (
+    line = (
         f"{ts} | TRUCK_ID={event_id} | COVER_STATUS={cover_status} | "
-        f"MATERIAL={material} | VIOLATION={violation_display}"
+        f"MATERIAL={material} | FILL={fill_display} | VIOLATION={violation_display}"
     )
+    if fill_best_frame is not None:
+        line += f" | FILL_FRAME={fill_best_frame}"
+    return line
 
 
 def _event_violation_display(event: dict[str, Any]) -> str:
@@ -529,6 +549,61 @@ def _event_violation_display(event: dict[str, Any]) -> str:
     return "True"
 
 
+def _event_fill_display(event: dict[str, Any]) -> str:
+    fill_estimation = event.get("fill_estimation")
+    if not isinstance(fill_estimation, dict):
+        return "n/a"
+
+    fill_percentage = fill_estimation.get("fill_percentage")
+    status = str(fill_estimation.get("status", "")).strip().lower()
+    if fill_percentage is None:
+        return status if status else "n/a"
+
+    try:
+        return f"{float(fill_percentage):.2f}%"
+    except Exception:
+        return str(fill_percentage)
+
+
+def _match_size_event(candidate_event: dict[str, Any], size_events: list[SizeEvent], used_indices: set[int]) -> SizeEvent | None:
+    start_frame = int(candidate_event.get("start_frame", -1))
+    end_frame = int(candidate_event.get("end_frame", -1))
+    best_frame = int(candidate_event.get("best_frame", -1))
+    best_match = None
+    best_key = None
+    for index, size_event in enumerate(size_events):
+        if index in used_indices:
+            continue
+        overlap = max(0, min(end_frame, size_event.end_frame) - max(start_frame, size_event.start_frame) + 1)
+        gap = min(abs(best_frame - size_event.best_frame), abs(start_frame - size_event.start_frame), abs(end_frame - size_event.end_frame))
+        key = (1 if overlap > 0 else 0, overlap, -gap)
+        if best_key is None or key > best_key:
+            best_key = key
+            best_match = (index, size_event)
+    if best_match is None:
+        return None
+    used_indices.add(best_match[0])
+    return best_match[1]
+
+
+def _merge_size_result_into_event(event: dict[str, Any], size_event: SizeEvent | None) -> dict[str, Any]:
+    if size_event is None:
+        return event
+    merged = dict(event)
+    merged["fill_estimation"] = {
+        "status": size_event.fill_status,
+        "fill_percentage": size_event.fill_percentage,
+        "raw_output": size_event.raw_output,
+    }
+    merged["fill_best_frame"] = int(size_event.best_frame)
+    merged["fill_candidate_frames"] = [int(x) for x in size_event.history_frames]
+    merged["fill_shortlist_frames"] = [int(x) for x in size_event.shortlist_frames]
+    artifacts = dict(merged.get("artifacts", {}))
+    artifacts["fill_frame"] = size_event.best_frame_path
+    merged["artifacts"] = artifacts
+    return merged
+
+
 def _run_heavy_phases_on_crop(candidate: CropCandidate, models: ModelBundle, seg_conf_threshold: float) -> dict[str, Any]:
     crop = candidate.crop_bgr
 
@@ -550,6 +625,7 @@ def _run_heavy_phases_on_crop(candidate: CropCandidate, models: ModelBundle, seg
     shape = None
     irregular_type = None
     segmentation = None
+    fill_estimation = None
     violation = False
 
     if is_fully_covered:
@@ -738,6 +814,8 @@ def _majority_vote_run(runs: list[dict[str, Any]]) -> tuple[dict[str, Any], str,
     return chosen_run, chosen_label, dict(counts)
 
 
+
+
 def _event_box_xyxy(event: dict[str, Any]) -> tuple[int, int, int, int] | None:
     box = event.get("best_box_xyxy")
     if not isinstance(box, list) or len(box) != 4:
@@ -818,13 +896,16 @@ def _emit_event(event: dict[str, Any], events_jsonl_path: Path, logger) -> None:
         irregular_type=event.get("irregular_type"),
     )
     material = _event_material(event.get("segmentation"))
+    fill_display = _event_fill_display(event)
     violation_display = _event_violation_display(event)
     event_line = _format_event_console_line(
         ts=ts,
         event_id=int(event["event_id"]),
         cover_status=cover_status,
         material=material,
+        fill_display=fill_display,
         violation_display=violation_display,
+        fill_best_frame=event.get("fill_best_frame") if event.get("fill_best_frame") is not None else None,
     )
     banner = "=" * max(100, len(event_line))
     print(f"\n\033[1m{banner}\n{event_line}\n{banner}\033[0m")
@@ -924,6 +1005,7 @@ def _finalize_track_event(
             "shape": None,
             "irregular_type": None,
             "segmentation": None,
+            "fill_estimation": None,
             "violation": False,
             "final_reason": final_reason,
             "artifacts": {},
@@ -946,6 +1028,10 @@ def _finalize_track_event(
 
     raw_crop_path = events_images_dir / f"event_{track.track_id:05d}_bed_crop.jpg"
     cv2.imwrite(str(raw_crop_path), selected_candidate.crop_bgr)
+    raw_truck_crop_path = None
+    if selected_candidate.truck_crop_bgr is not None and getattr(selected_candidate.truck_crop_bgr, "size", 0) > 0:
+        raw_truck_crop_path = events_images_dir / f"event_{track.track_id:05d}_truck_crop.jpg"
+        cv2.imwrite(str(raw_truck_crop_path), selected_candidate.truck_crop_bgr)
     overlay_text = f"event={track.track_id} {result_summary} violation={best_run.get('violation', False)}"
     overlay_path = events_images_dir / f"event_{track.track_id:05d}_overlay.jpg"
     _candidate_to_overlay_image(selected_candidate, overlay_text, overlay_path)
@@ -962,12 +1048,14 @@ def _finalize_track_event(
         "shape": best_run.get("shape"),
         "irregular_type": best_run.get("irregular_type"),
         "segmentation": best_run.get("segmentation"),
+        "fill_estimation": None,
         "violation": bool(best_run.get("violation", False)),
         "result_summary": result_summary,
         "final_reason": final_reason,
         "artifacts": {
             "best_image": track.best_image_path,
             "bed_crop": str(raw_crop_path),
+            "truck_crop": str(raw_truck_crop_path) if raw_truck_crop_path is not None else None,
             "overlay_image": str(overlay_path),
         },
         "heavy_inference_calls": len(track.inference_runs),
@@ -989,6 +1077,7 @@ def run_stream_event(
     cls2_model_path: Path | str | None = None,
     cls3_model_path: Path | str | None = None,
     seg_model_path: Path | str | None = None,
+    size_seg_model_path: Path | str | None = None,
     missed_M: int = config.STREAM_MISSED_M,
     iou_threshold: float = config.STREAM_IOU_THRESHOLD,
     merge_window_frames: int = config.STREAM_MERGE_WINDOW,
@@ -1000,6 +1089,8 @@ def run_stream_event(
     top2: bool = config.STREAM_TOP2,
     every_n: int = config.STREAM_EVERY_N,
     max_detect_fps: float = config.STREAM_MAX_DETECT_FPS,
+    size_sampling_fps: float = config.SIZE_SAMPLING_FPS,
+    size_preview_every_samples: int = 1,
     detect_conf_threshold: float | None = None,
     seg_conf_threshold: float | None = None,
     min_best_area: int = config.STREAM_MIN_BEST_AREA,
@@ -1007,6 +1098,7 @@ def run_stream_event(
     bed_class_ids: list[int] | None = None,
     truck_class_ids: list[int] | None = None,
     show_preview: bool = False,
+    size_show_preview: bool | None = None,
     preview_scale: float = 1.0,
     preview_fullscreen: bool = False,
     summary_only: bool = False,
@@ -1038,8 +1130,13 @@ def run_stream_event(
     debug_tracking: bool = False,
     max_frames: int | None = None,
 ) -> bool:
+    if size_show_preview is None:
+        size_show_preview = show_preview
+    size_preview_every_samples = max(1, int(size_preview_every_samples))
+
     ensure_dirs([config.OUTPUT_DIR, config.STREAM_EVENTS_IMAGES_DIR, config.PROJECT_ROOT / "logs"])
     logger = setup_logger("stream_event", config.PROJECT_ROOT / "logs" / "stream_event.log")
+    collected_events: list[dict[str, Any]] = []
     if summary_only:
         for h in logger.handlers:
             if isinstance(h, logging.FileHandler):
@@ -1058,6 +1155,7 @@ def run_stream_event(
         logger.warning("top2 was requested but is disabled by centered-frame policy; forcing top2=0.")
     every_n = max(1, int(every_n))
     max_detect_fps = max(0.0, float(max_detect_fps))
+    size_sampling_fps = max(0.1, float(size_sampling_fps))
     missed_M = max(1, int(missed_M))
     merge_window_frames = max(1, int(merge_window_frames))
     merge_iou_threshold = float(max(0.0, min(1.0, merge_iou_threshold)))
@@ -1139,6 +1237,27 @@ def run_stream_event(
             )
 
     video_fps = float(cap.get(cv2.CAP_PROP_FPS) or 0.0)
+    size_pipeline: OnlineSizeEventPipeline | None = None
+    size_events: list[SizeEvent] = []
+    used_size_indices: set[int] = set()
+    try:
+        size_truck_path = _ensure_model_path(None, config.SIZE_TRUCK_MODEL_PATH, "SIZE_TRUCK_MODEL_PATH")
+        size_seg_path = _ensure_model_path(size_seg_model_path, config.SIZE_SEG_MODEL_PATH, "SIZE_SEG_MODEL_PATH")
+        size_output_dir = config.SIZE_PIPELINE_OUTPUT_DIR / video.stem
+        size_pipeline = OnlineSizeEventPipeline(
+            video_path=video,
+            truck_model_path=size_truck_path,
+            size_model_path=size_seg_path,
+            sampling_fps=size_sampling_fps,
+            output_dir=size_output_dir,
+            source_fps=video_fps or 25.0,
+            show_preview=bool(size_show_preview),
+            preview_scale=preview_scale,
+            preview_every_samples=size_preview_every_samples,
+        )
+    except FileNotFoundError as exc:
+        logger.warning("Independent size pipeline disabled: %s", exc)
+
     if max_detect_fps > 0.0 and video_fps > 0.0:
         auto_every_n = max(1, int(math.ceil(video_fps / max_detect_fps)))
         if auto_every_n > every_n:
@@ -1150,7 +1269,6 @@ def run_stream_event(
                 every_n,
             )
             every_n = auto_every_n
-
     tracker = IoUTracker(
         iou_threshold=iou_threshold,
         missed_M=missed_M,
@@ -1224,6 +1342,16 @@ def run_stream_event(
     max_frame_seen = -1
     last_frame_shape: tuple[int, int] | None = None
 
+    def emit_event_with_current_size_result(event: dict[str, Any]) -> dict[str, Any]:
+        if size_pipeline is not None:
+            size_events.extend(size_pipeline.pop_completed_events())
+        size_event = _match_size_event(event, size_events, used_size_indices)
+        if size_event is None and size_pipeline is not None:
+            size_event = size_pipeline.force_finalize_best_match(event)
+        merged_event = _merge_size_result_into_event(event, size_event)
+        _emit_event(merged_event, events_jsonl_path=events_jsonl, logger=logger)
+        return merged_event
+
     try:
         while True:
             ok, frame = cap.read()
@@ -1231,6 +1359,8 @@ def run_stream_event(
                 break
             frame_idx += 1
             max_frame_seen = frame_idx
+            if size_pipeline is not None:
+                size_pipeline.process_frame(frame, frame_idx)
             if max_frames is not None and frame_idx >= int(max_frames):
                 logger.info("Stopping early at frame=%s due to max_frames=%s", frame_idx, max_frames)
                 break
@@ -1303,6 +1433,11 @@ def run_stream_event(
                 bx1, by1, bx2, by2 = clamp_xyxy(*track.bed_box_xyxy, frame_w, frame_h)
                 if bx2 <= bx1 or by2 <= by1:
                     continue
+                tx1, ty1, tx2, ty2 = clamp_xyxy(*track.truck_box_xyxy, frame_w, frame_h)
+                if tx2 <= tx1 or ty2 <= ty1:
+                    continue
+                raw_tx1, raw_ty1, raw_tx2, raw_ty2 = clamp_xyxy(*track.raw_truck_box_xyxy, frame_w, frame_h)
+                truck_crop = frame[raw_ty1:raw_ty2, raw_tx1:raw_tx2]
                 crop = frame[by1:by2, bx1:bx2]
                 if crop is None or crop.size == 0:
                     continue
@@ -1325,6 +1460,8 @@ def run_stream_event(
                     centeredness=centeredness,
                     score=score,
                     crop_bgr=crop.copy(),
+                    truck_xyxy=(raw_tx1, raw_ty1, raw_tx2, raw_ty2),
+                    truck_crop_bgr=truck_crop.copy(),
                 )
                 best_updated = tracker.add_candidate(track.track_id, candidate)
                 if vote_enable:
@@ -1339,7 +1476,6 @@ def run_stream_event(
 
                 if best_updated:
                     debug_frame = frame.copy()
-                    tx1, ty1, tx2, ty2 = clamp_xyxy(*track.truck_box_xyxy, frame_w, frame_h)
                     cv2.rectangle(debug_frame, (tx1, ty1), (tx2, ty2), (255, 100, 0), 4)
                     cv2.rectangle(debug_frame, (bx1, by1), (bx2, by2), (0, 220, 0), 4)
                     cv2.putText(
@@ -1449,10 +1585,10 @@ def run_stream_event(
                         d_dist,
                     )
                     continue
-                _emit_event(event, events_jsonl_path=events_jsonl, logger=logger)
-                recent_emitted_events.append(event)
+                emitted_event = emit_event_with_current_size_result(event)
+                recent_emitted_events.append(emitted_event)
                 if recent_emitted_events:
-                    newest_end = int(event.get("end_frame", -1))
+                    newest_end = int(emitted_event.get("end_frame", -1))
                     while recent_emitted_events:
                         oldest_end = int(recent_emitted_events[0].get("end_frame", -1))
                         if newest_end - oldest_end <= event_dedup_window_frames:
@@ -1569,10 +1705,10 @@ def run_stream_event(
                     )
                     tracker.active_tracks.pop(track_id, None)
                     continue
-                _emit_event(event, events_jsonl_path=events_jsonl, logger=logger)
-                recent_emitted_events.append(event)
+                emitted_event = emit_event_with_current_size_result(event)
+                recent_emitted_events.append(emitted_event)
                 if recent_emitted_events:
-                    newest_end = int(event.get("end_frame", -1))
+                    newest_end = int(emitted_event.get("end_frame", -1))
                     while recent_emitted_events:
                         oldest_end = int(recent_emitted_events[0].get("end_frame", -1))
                         if newest_end - oldest_end <= event_dedup_window_frames:
@@ -1586,6 +1722,8 @@ def run_stream_event(
 
     finally:
         cap.release()
+        if size_pipeline is not None:
+            size_pipeline.close()
         if show_preview:
             cv2.destroyAllWindows()
 

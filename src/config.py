@@ -9,6 +9,7 @@ WEIGHTS_DIR = PROJECT_ROOT / "weights"
 OUTPUT_DIR = PROJECT_ROOT / "outputs"
 INPUT_IMAGES_DIR = PROJECT_ROOT / "data" / "images"
 MARCH25_WEIGHTS_DIR = WEIGHTS_DIR / "weights_March_25"
+SIBLING_TRUCK_SIZE_DIR = PROJECT_ROOT.parent / "repo_size"
 
 # Phase 1 defaults
 TOP1_ONLY = True
@@ -35,6 +36,7 @@ TRUCK_FALLBACK_CLASS_NAMES = [
 
 # Phase 2 defaults
 PHASE1_CROPS_DIR = OUTPUT_DIR / "phase1_crops"
+PHASE1_TRUCK_CROPS_DIR = OUTPUT_DIR / "phase1_truck_crops"
 PHASE2_OUTPUT_DIR = OUTPUT_DIR / "phase2_classification"
 PHASE2_SUMMARY_CSV = OUTPUT_DIR / "phase2_summary.csv"
 PHASE2_IMAGE_GATE_CSV = OUTPUT_DIR / "phase2_image_gate.csv"
@@ -55,6 +57,18 @@ PHASE5_MASKS_DIR = OUTPUT_DIR / "phase5_masks"
 PHASE5_SUMMARY_CSV = OUTPUT_DIR / "phase5_summary.csv"
 PHASE5_IMAGE_GATE_CSV = OUTPUT_DIR / "phase5_image_gate.csv"
 PHASE5_SEG_CONF_THRESHOLD = 0.25
+
+# Truck-fill estimation defaults
+SIZE_SEG_CONF_THRESHOLD = 0.25
+SIZE_BOX_CLASS_NAMES = ["box"]
+SIZE_CONTENT_CLASS_NAMES = ["content"]
+SIZE_PIPELINE_OUTPUT_DIR = OUTPUT_DIR / "size_pipeline"
+SIZE_TRUCK_CROP_EXPAND_X = 1.00
+SIZE_TRUCK_CROP_EXPAND_Y = 2.80
+SIZE_TRUCK_CROP_FULL_HEIGHT_RATIO = 0.75
+SIZE_TRUCK_CROP_FULL_BOTTOM_RATIO = 0.85
+SIZE_TRUCK_CROP_FULL_BOX_PAD_PX = 4
+SIZE_SAMPLING_FPS = 5.0
 
 # Stream-event defaults
 STREAM_EVENTS_JSONL = OUTPUT_DIR / "events.jsonl"
@@ -367,6 +381,88 @@ def _auto_discover_seg_model_path() -> Path | None:
     return ranked[0]
 
 
+def _score_size_seg_candidate(path: Path) -> int:
+    lower = str(path).lower()
+    score = 0
+    if "best_size_march_25" in lower:
+        score += 50
+    if "sizev2" in lower:
+        score += 20
+    if "yolo-wight" in lower or "yolo_weight" in lower or "weights" in lower:
+        score += 5
+    if "size" in lower:
+        score += 12
+    if path.name.lower() == "best.pt":
+        score += 2
+    if "truck.pt" in lower:
+        score -= 50
+    return score
+
+
+def _score_size_truck_detect_candidate(path: Path) -> int:
+    lower = str(path).lower()
+    score = 0
+    if "repo_size" in lower or "yolo-wight" in lower:
+        score += 20
+    if path.name.lower() == "truck.pt":
+        score += 100
+    if "truck" in lower:
+        score += 20
+    if "size" in lower and path.name.lower() != "truck.pt":
+        score -= 20
+    if "best_size" in lower:
+        score -= 40
+    return score
+
+
+def _auto_discover_size_truck_model_path() -> Path | None:
+    search_roots = [PROJECT_ROOT, WEIGHTS_DIR, SIBLING_TRUCK_SIZE_DIR]
+    pt_files: list[Path] = []
+    for root in search_roots:
+        if not root.exists():
+            continue
+        try:
+            pt_files.extend(root.rglob("*.pt"))
+        except Exception:
+            continue
+    pt_files = sorted(set(pt_files))
+    if not pt_files:
+        return None
+
+    ranked = sorted(
+        pt_files,
+        key=lambda p: (_score_size_truck_detect_candidate(p), str(p).lower()),
+        reverse=True,
+    )
+    if _score_size_truck_detect_candidate(ranked[0]) <= 0:
+        return None
+    return ranked[0]
+
+
+def _auto_discover_size_seg_model_path() -> Path | None:
+    search_roots = [PROJECT_ROOT, WEIGHTS_DIR, SIBLING_TRUCK_SIZE_DIR]
+    pt_files: list[Path] = []
+    for root in search_roots:
+        if not root.exists():
+            continue
+        try:
+            pt_files.extend(root.rglob("*.pt"))
+        except Exception:
+            continue
+    pt_files = sorted(set(pt_files))
+    if not pt_files:
+        return None
+
+    ranked = sorted(
+        pt_files,
+        key=lambda p: (_score_size_seg_candidate(p), str(p).lower()),
+        reverse=True,
+    )
+    if _score_size_seg_candidate(ranked[0]) <= 0:
+        return None
+    return ranked[0]
+
+
 _env_detect_model = os.getenv("DETECT_MODEL_PATH")
 if _env_detect_model:
     _candidate = Path(_env_detect_model).expanduser()
@@ -411,3 +507,21 @@ if _env_seg_model:
     SEG_MODEL_PATH = _candidate.resolve()
 else:
     SEG_MODEL_PATH = _auto_discover_seg_model_path()
+
+_env_size_seg_model = os.getenv("SIZE_SEG_MODEL_PATH")
+if _env_size_seg_model:
+    _candidate = Path(_env_size_seg_model).expanduser()
+    if not _candidate.is_absolute():
+        _candidate = PROJECT_ROOT / _candidate
+    SIZE_SEG_MODEL_PATH = _candidate.resolve()
+else:
+    SIZE_SEG_MODEL_PATH = _auto_discover_size_seg_model_path()
+
+_env_size_truck_model = os.getenv("SIZE_TRUCK_MODEL_PATH")
+if _env_size_truck_model:
+    _candidate = Path(_env_size_truck_model).expanduser()
+    if not _candidate.is_absolute():
+        _candidate = PROJECT_ROOT / _candidate
+    SIZE_TRUCK_MODEL_PATH = _candidate.resolve()
+else:
+    SIZE_TRUCK_MODEL_PATH = _auto_discover_size_truck_model_path()

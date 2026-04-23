@@ -122,6 +122,12 @@ def parse_args() -> argparse.Namespace:
         help="Path to Phase 5 segmentation .pt model.",
     )
     parser.add_argument(
+        "--size-seg-model",
+        type=str,
+        default=str(config.SIZE_SEG_MODEL_PATH) if config.SIZE_SEG_MODEL_PATH else "",
+        help="Path to truck-fill segmentation .pt model used on truck crops.",
+    )
+    parser.add_argument(
         "--phase5-input-csv",
         type=str,
         default=str(config.PHASE2_SUMMARY_CSV),
@@ -258,6 +264,18 @@ def parse_args() -> argparse.Namespace:
         help="Optional cap for detector run rate. 0 disables cap.",
     )
     parser.add_argument(
+        "--size-sampling-fps",
+        type=float,
+        default=config.SIZE_SAMPLING_FPS,
+        help="Sampling FPS used by the integrated truck-size candidate selection.",
+    )
+    parser.add_argument(
+        "--size-preview-every",
+        type=int,
+        default=1,
+        help="Render expensive blue/green size segmentation overlay every N size samples. 1 renders every sample.",
+    )
+    parser.add_argument(
         "--track-confirm-hits",
         type=int,
         default=config.STREAM_TRACK_CONFIRM_HITS,
@@ -286,7 +304,17 @@ def parse_args() -> argparse.Namespace:
         type=int,
         choices=[0, 1],
         default=0,
-        help="Show live preview window during stream_event detection/tracking.",
+        help="Show first-repo compliance detection/tracking preview during stream_event.",
+    )
+    parser.add_argument(
+        "--size-show",
+        type=int,
+        choices=[0, 1],
+        default=None,
+        help=(
+            "Show independent second-repo size-estimation preview. "
+            "Defaults to the same value as --show."
+        ),
     )
     parser.add_argument(
         "--preview-scale",
@@ -407,6 +435,7 @@ def main() -> int:
         cls2_model = Path(args.cls2_model) if args.cls2_model else None
         cls3_model = Path(args.cls3_model) if args.cls3_model else None
         seg_model = Path(args.seg_model) if args.seg_model else None
+        size_seg_model = Path(args.size_seg_model) if args.size_seg_model else None
         ok = run_stream_event(
             video_path=Path(args.video_path),
             detect_model_path=detect_model,
@@ -414,6 +443,7 @@ def main() -> int:
             cls2_model_path=cls2_model,
             cls3_model_path=cls3_model,
             seg_model_path=seg_model,
+            size_seg_model_path=size_seg_model,
             missed_M=args.missed_M,
             iou_threshold=args.iou_threshold,
             merge_window_frames=args.merge_window,
@@ -425,11 +455,14 @@ def main() -> int:
             top2=bool(args.top2),
             every_n=args.every_n,
             max_detect_fps=args.max_detect_fps,
+            size_sampling_fps=args.size_sampling_fps,
+            size_preview_every_samples=args.size_preview_every,
             detect_conf_threshold=args.detect_conf,
             seg_conf_threshold=args.seg_conf,
             bed_class_ids=args.bed_class_id,
             truck_class_ids=args.truck_class_id,
             show_preview=bool(args.show),
+            size_show_preview=bool(args.size_show) if args.size_show is not None else bool(args.show),
             preview_scale=args.preview_scale,
             preview_fullscreen=bool(args.preview_fullscreen),
             summary_only=bool(args.summary_only),
@@ -452,10 +485,12 @@ def main() -> int:
     else:
         if args.phase == "phase1":
             detect_model = Path(args.detect_model) if args.detect_model else None
+            size_seg_model = Path(args.size_seg_model) if args.size_seg_model else None
             top1_only = False if args.all_crops else bool(args.top1_only)
             ok = run_phase1(
                 input_images_dir=Path(args.input_dir),
                 detect_model_path=detect_model,
+                size_seg_model_path=size_seg_model,
                 top1_only=top1_only,
                 bed_class_ids=args.bed_class_id,
                 bed_class_names=args.bed_class_name,

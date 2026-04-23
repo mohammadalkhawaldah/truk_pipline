@@ -10,6 +10,7 @@ import cv2
 from ultralytics import YOLO
 
 from src import config
+from src.fill_estimation import estimate_fill_for_truck_crop, load_size_seg_model
 from src.utils import clamp_xyxy, ensure_dirs, list_image_files, load_image_bgr, setup_logger
 
 
@@ -20,6 +21,7 @@ class BedDetection:
     cls_id: int
     cls_name: str
     source: str
+    truck_xyxy: tuple[int, int, int, int] | None = None
 
 
 def _normalize_label(label: str) -> str:
@@ -153,6 +155,78 @@ def heuristic_bed_from_truck_bbox(xyxy: tuple[float, float, float, float]) -> tu
     return hx1, hy1, hx2, hy2
 
 
+def expand_bed_to_truck_bbox(
+    xyxy: tuple[int, int, int, int],
+    width: int,
+    height: int,
+) -> tuple[int, int, int, int]:
+    x1, y1, x2, y2 = xyxy
+    cx = (x1 + x2) / 2.0
+    cy = (y1 + y2) / 2.0
+    bw = max(1.0, float(x2 - x1)) * max(0.01, float(config.EXPAND_BED_TO_TRUCK_X))
+    bh = max(1.0, float(y2 - y1)) * max(0.01, float(config.EXPAND_BED_TO_TRUCK_Y))
+    tx1 = cx - (bw / 2.0)
+    ty1 = cy - (bh / 2.0)
+    tx2 = cx + (bw / 2.0)
+    ty2 = cy + (bh / 2.0)
+    return clamp_xyxy(tx1, ty1, tx2, ty2, width, height)
+
+
+def expand_truck_bbox_for_fill(
+    xyxy: tuple[int, int, int, int],
+    width: int,
+    height: int,
+) -> tuple[int, int, int, int]:
+    x1, y1, x2, y2 = xyxy
+    box_height_ratio = max(0.0, float(y2 - y1)) / max(1.0, float(height))
+    box_bottom_ratio = float(y2) / max(1.0, float(height))
+    if (
+        box_height_ratio >= float(config.SIZE_TRUCK_CROP_FULL_HEIGHT_RATIO)
+        or box_bottom_ratio >= float(config.SIZE_TRUCK_CROP_FULL_BOTTOM_RATIO)
+    ):
+        top_pad = int(config.SIZE_TRUCK_CROP_FULL_BOX_PAD_PX)
+        return clamp_xyxy(x1, y1 - top_pad, x2, y2, width, height)
+    cx = (x1 + x2) / 2.0
+    cy = (y1 + y2) / 2.0
+    bw = max(1.0, float(x2 - x1)) * max(0.01, float(config.SIZE_TRUCK_CROP_EXPAND_X))
+    bh = max(1.0, float(y2 - y1)) * max(0.01, float(config.SIZE_TRUCK_CROP_EXPAND_Y))
+    tx1 = cx - (bw / 2.0)
+    ty1 = cy - (bh / 2.0)
+    tx2 = cx + (bw / 2.0)
+    ty2 = cy + (bh / 2.0)
+    return clamp_xyxy(tx1, ty1, tx2, ty2, width, height)
+
+
+def _bbox_center(box_xyxy: tuple[int, int, int, int]) -> tuple[float, float]:
+    x1, y1, x2, y2 = box_xyxy
+    return ((x1 + x2) / 2.0, (y1 + y2) / 2.0)
+
+
+def _point_in_box(px: float, py: float, box_xyxy: tuple[int, int, int, int]) -> bool:
+    x1, y1, x2, y2 = box_xyxy
+    return (px >= x1) and (px <= x2) and (py >= y1) and (py <= y2)
+
+
+def _iou_xyxy(a: tuple[int, int, int, int], b: tuple[int, int, int, int]) -> float:
+    ax1, ay1, ax2, ay2 = a
+    bx1, by1, bx2, by2 = b
+    ix1 = max(ax1, bx1)
+    iy1 = max(ay1, by1)
+    ix2 = min(ax2, bx2)
+    iy2 = min(ay2, by2)
+    iw = max(0, ix2 - ix1)
+    ih = max(0, iy2 - iy1)
+    inter = iw * ih
+    if inter <= 0:
+        return 0.0
+    area_a = max(0, ax2 - ax1) * max(0, ay2 - ay1)
+    area_b = max(0, bx2 - bx1) * max(0, by2 - by1)
+    union = area_a + area_b - inter
+    if union <= 0:
+        return 0.0
+    return float(inter / union)
+
+
 def extract_bed_detections(
     result,
     names: dict[int, str],
@@ -164,9 +238,17 @@ def extract_bed_detections(
     h, w = orig.shape[:2]
     boxes = result.boxes
     detections: list[BedDetection] = []
+    truck_boxes: list[tuple[int, int, int, int]] = []
 
     if boxes is None or len(boxes) == 0:
         return detections
+
+    for i in range(len(boxes)):
+        cls_id = int(boxes.cls[i].item())
+        if truck_ids and cls_id not in truck_ids:
+            continue
+        x1, y1, x2, y2 = boxes.xyxy[i].tolist()
+        truck_boxes.append(clamp_xyxy(x1, y1, x2, y2, w, h))
 
     for i in range(len(boxes)):
         cls_id = int(boxes.cls[i].item())
@@ -175,13 +257,30 @@ def extract_bed_detections(
         cls_name = names.get(cls_id, f"class_{cls_id}")
         if bed_ids and cls_id in bed_ids:
             cx1, cy1, cx2, cy2 = clamp_xyxy(x1, y1, x2, y2, w, h)
+            bed_xyxy = (cx1, cy1, cx2, cy2)
+            bx, by = _bbox_center(bed_xyxy)
+            best_truck_xyxy = None
+            best_key = (-1.0, -1.0)
+            for truck_xyxy in truck_boxes:
+                iou = _iou_xyxy(bed_xyxy, truck_xyxy)
+                if iou <= 0.0 and not _point_in_box(bx, by, truck_xyxy):
+                    continue
+                tx1, ty1, tx2, ty2 = truck_xyxy
+                area = max(0, (tx2 - tx1) * (ty2 - ty1))
+                key = (iou, float(area))
+                if key > best_key:
+                    best_key = key
+                    best_truck_xyxy = truck_xyxy
+            if best_truck_xyxy is None:
+                best_truck_xyxy = expand_bed_to_truck_bbox(bed_xyxy, w, h)
             detections.append(
                 BedDetection(
-                    xyxy=(cx1, cy1, cx2, cy2),
+                    xyxy=bed_xyxy,
                     conf=conf,
                     cls_id=cls_id,
                     cls_name=cls_name,
                     source="direct",
+                    truck_xyxy=best_truck_xyxy,
                 )
             )
 
@@ -206,6 +305,7 @@ def extract_bed_detections(
                 cls_id=cls_id,
                 cls_name=f"{cls_name}_heuristic",
                 source="heuristic",
+                truck_xyxy=(cx1, cy1, cx2, cy2),
             )
         )
 
@@ -235,6 +335,7 @@ def draw_detections(image_bgr, detections: list[BedDetection]):
 def run_phase1(
     input_images_dir: Path | str | None = None,
     detect_model_path: Path | str | None = None,
+    size_seg_model_path: Path | str | None = None,
     top1_only: bool = config.TOP1_ONLY,
     bed_class_ids: list[int] | None = None,
     bed_class_names: list[str] | None = None,
@@ -244,8 +345,9 @@ def run_phase1(
 ) -> bool:
     output_det_dir = config.OUTPUT_DIR / "phase1_detection"
     output_crops_dir = config.OUTPUT_DIR / "phase1_crops"
+    output_truck_crops_dir = config.PHASE1_TRUCK_CROPS_DIR
     logs_dir = config.PROJECT_ROOT / "logs"
-    ensure_dirs([config.OUTPUT_DIR, output_det_dir, output_crops_dir, logs_dir])
+    ensure_dirs([config.OUTPUT_DIR, output_det_dir, output_crops_dir, output_truck_crops_dir, logs_dir])
 
     logger = setup_logger("phase1", logs_dir / "phase1.log")
 
@@ -271,6 +373,22 @@ def run_phase1(
 
     logger.info("Loading YOLO model on CPU: %s", model_path)
     model = YOLO(str(model_path))
+    size_model = None
+    size_names: dict[int, str] = {}
+    resolved_size_seg_model_path = None
+    if size_seg_model_path is not None:
+        resolved_size_seg_model_path = Path(size_seg_model_path)
+        if not resolved_size_seg_model_path.is_absolute():
+            resolved_size_seg_model_path = (config.PROJECT_ROOT / resolved_size_seg_model_path).resolve()
+    elif config.SIZE_SEG_MODEL_PATH is not None and config.SIZE_SEG_MODEL_PATH.exists():
+        resolved_size_seg_model_path = config.SIZE_SEG_MODEL_PATH
+
+    if resolved_size_seg_model_path is not None and resolved_size_seg_model_path.exists():
+        logger.info("Loading truck-size segmentation model on CPU: %s", resolved_size_seg_model_path)
+        size_model = load_size_seg_model(resolved_size_seg_model_path)
+        size_names = _names_to_dict(size_model.names)
+    else:
+        logger.info("Truck-size segmentation model not found; Phase 1 fill estimation disabled.")
 
     names = _names_to_dict(model.names)
     logger.info("Model class names (index -> name):")
@@ -330,14 +448,19 @@ def run_phase1(
         cv2.imwrite(str(det_out_path), det_annotated)
 
         crop_paths: list[Path] = []
+        truck_crop_paths: list[Path] = []
         crop_sizes: list[tuple[int, int]] = []
+        truck_crop_sizes: list[tuple[int, int]] = []
         best_conf = None
+        best_fill_percentage = None
+        best_fill_status = ""
         for k, det in enumerate(bed_dets, start=1):
             x1, y1, x2, y2 = det.xyxy
             crop = image_bgr[y1:y2, x1:x2]
             crop_h, crop_w = crop.shape[:2] if crop is not None else (0, 0)
             crop_area = crop_h * crop_w
             crop_path = output_crops_dir / f"{image_path.stem}_crop_{k}.jpg"
+            truck_crop_path = output_truck_crops_dir / f"{image_path.stem}_truck_crop_{k}.jpg"
 
             if crop_h <= 0 or crop_w <= 0:
                 failures.append(f"{image_path.name}: empty crop generated for detection {k}")
@@ -358,6 +481,29 @@ def run_phase1(
                     f"{image_path.name}: crop area too small ({crop_area}) <= threshold ({config.MIN_CROP_AREA})"
                 )
 
+            truck_xyxy = det.truck_xyxy if det.truck_xyxy is not None else expand_bed_to_truck_bbox(det.xyxy, image_bgr.shape[1], image_bgr.shape[0])
+            truck_xyxy = expand_truck_bbox_for_fill(truck_xyxy, image_bgr.shape[1], image_bgr.shape[0])
+            tx1, ty1, tx2, ty2 = truck_xyxy
+            truck_crop = image_bgr[ty1:ty2, tx1:tx2]
+            truck_h, truck_w = truck_crop.shape[:2] if truck_crop is not None else (0, 0)
+            if truck_h <= 0 or truck_w <= 0:
+                failures.append(f"{image_path.name}: empty truck crop generated for detection {k}")
+            else:
+                cv2.imwrite(str(truck_crop_path), truck_crop)
+                truck_crop_paths.append(truck_crop_path)
+                truck_crop_sizes.append((truck_w, truck_h))
+                if not truck_crop_path.exists():
+                    failures.append(f"{image_path.name}: truck crop file missing after write: {truck_crop_path}")
+                if size_model is not None and best_fill_percentage is None:
+                    fill_result = estimate_fill_for_truck_crop(
+                        truck_crop_bgr=truck_crop,
+                        size_model=size_model,
+                        size_names=size_names,
+                        seg_conf_threshold=config.SIZE_SEG_CONF_THRESHOLD,
+                    )
+                    best_fill_percentage = fill_result.get("fill_percentage")
+                    best_fill_status = str(fill_result.get("status", ""))
+
         if not crop_paths:
             failures.append(f"{image_path.name}: no crop saved (detections_count={detections_count})")
 
@@ -370,8 +516,11 @@ def run_phase1(
         )
 
         best_crop_path = str(crop_paths[0]) if crop_paths else ""
+        best_truck_crop_path = str(truck_crop_paths[0]) if truck_crop_paths else ""
         best_w = crop_sizes[0][0] if crop_sizes else ""
         best_h = crop_sizes[0][1] if crop_sizes else ""
+        best_truck_w = truck_crop_sizes[0][0] if truck_crop_sizes else ""
+        best_truck_h = truck_crop_sizes[0][1] if truck_crop_sizes else ""
 
         summary_rows.append(
             {
@@ -381,6 +530,13 @@ def run_phase1(
                 "best_crop_path": best_crop_path,
                 "best_crop_w": best_w,
                 "best_crop_h": best_h,
+                "best_truck_crop_path": best_truck_crop_path,
+                "best_truck_crop_w": best_truck_w,
+                "best_truck_crop_h": best_truck_h,
+                "best_fill_percentage": (
+                    f"{float(best_fill_percentage):.2f}" if best_fill_percentage is not None else ""
+                ),
+                "best_fill_status": best_fill_status,
                 "best_conf": f"{best_conf:.6f}" if best_conf is not None else "",
             }
         )
@@ -396,6 +552,11 @@ def run_phase1(
                 "best_crop_path",
                 "best_crop_w",
                 "best_crop_h",
+                "best_truck_crop_path",
+                "best_truck_crop_w",
+                "best_truck_crop_h",
+                "best_fill_percentage",
+                "best_fill_status",
                 "best_conf",
             ],
         )

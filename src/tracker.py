@@ -27,6 +27,8 @@ class CropCandidate:
     centeredness: float
     score: float
     crop_bgr: Any
+    truck_xyxy: tuple[int, int, int, int] | None = None
+    truck_crop_bgr: Any = None
 
 
 @dataclass
@@ -53,6 +55,8 @@ class TrackState:
     top_candidates: list[CropCandidate] = field(default_factory=list)
     vote_candidates: list[CropCandidate] = field(default_factory=list)
     last_vote_sample_frame: int | None = None
+    fill_candidates: list[CropCandidate] = field(default_factory=list)
+    last_fill_sample_frame: int | None = None
     inference_runs: list[dict[str, Any]] = field(default_factory=list)
     phase_results: dict[str, Any] | None = None
     best_image_path: str | None = None
@@ -86,6 +90,8 @@ class LostTrackSnapshot:
     best_candidate: CropCandidate | None
     vote_candidates: list[CropCandidate]
     last_vote_sample_frame: int | None
+    fill_candidates: list[CropCandidate]
+    last_fill_sample_frame: int | None
     phase_results: dict[str, Any] | None
     best_image_path: str | None
 
@@ -342,6 +348,8 @@ class IoUTracker:
                 best_candidate=track.best_candidate,
                 vote_candidates=list(track.vote_candidates),
                 last_vote_sample_frame=track.last_vote_sample_frame,
+                fill_candidates=list(track.fill_candidates),
+                last_fill_sample_frame=track.last_fill_sample_frame,
                 phase_results=track.phase_results,
                 best_image_path=track.best_image_path,
             )
@@ -606,6 +614,14 @@ class IoUTracker:
             dst.last_vote_sample_frame = max(c.frame_idx for c in dst.vote_candidates)
         elif src.last_vote_sample_frame is not None:
             dst.last_vote_sample_frame = src.last_vote_sample_frame
+
+        fill_keep = max(len(dst.fill_candidates), len(src.fill_candidates), 1)
+        merged_fill = sorted(dst.fill_candidates + src.fill_candidates, key=lambda c: c.frame_idx)
+        if merged_fill:
+            dst.fill_candidates = merged_fill[-fill_keep:]
+            dst.last_fill_sample_frame = max(c.frame_idx for c in dst.fill_candidates)
+        elif src.last_fill_sample_frame is not None:
+            dst.last_fill_sample_frame = src.last_fill_sample_frame
 
         if src.inference_runs:
             existing_frames = {int(r.get("candidate_frame", -1)) for r in dst.inference_runs}
@@ -917,6 +933,8 @@ class IoUTracker:
                 track.best_candidate = lost_item.best_candidate
                 track.vote_candidates = list(lost_item.vote_candidates)
                 track.last_vote_sample_frame = lost_item.last_vote_sample_frame
+                track.fill_candidates = list(lost_item.fill_candidates)
+                track.last_fill_sample_frame = lost_item.last_fill_sample_frame
                 track.phase_results = lost_item.phase_results
                 track.best_image_path = lost_item.best_image_path
                 track.matched_in_update = True
@@ -1016,3 +1034,26 @@ class IoUTracker:
             if int(run.get("candidate_frame", -1)) == int(frame_idx):
                 return True
         return False
+
+    def add_fill_candidate(
+        self,
+        track_id: int,
+        candidate: CropCandidate,
+    ) -> bool:
+        track = self.active_tracks.get(track_id)
+        if track is None:
+            return False
+
+        existing_frames = {c.frame_idx for c in track.fill_candidates}
+        if candidate.frame_idx in existing_frames:
+            for i, c in enumerate(track.fill_candidates):
+                if c.frame_idx == candidate.frame_idx and candidate.score > c.score:
+                    track.fill_candidates[i] = candidate
+                    track.last_fill_sample_frame = int(candidate.frame_idx)
+                    return True
+            return False
+
+        track.fill_candidates.append(candidate)
+        track.fill_candidates = sorted(track.fill_candidates, key=lambda c: c.frame_idx)
+        track.last_fill_sample_frame = int(candidate.frame_idx)
+        return True
